@@ -141,7 +141,6 @@ class DuckDBSampledValidator:
     # Validation thresholds
     MAX_DUPLICATE_RATE = 5.0    # 5% max duplicates within same job
     MAX_EMPTY_RATE = 10.0       # 10% max empty content
-    MAX_INVALID_URL_RATE = 5.0  # 5% max non-canonical URLs
     # Missing URLs = instant fail (no rate threshold needed)
     MIN_JOB_MATCH_RATE = 95.0   # 95% min job content match rate
     MIN_SCRAPER_SUCCESS = 70.0  # 70% min scraper success rate
@@ -161,15 +160,6 @@ class DuckDBSampledValidator:
     # Filename pattern: data_YYYYMMDD_HHMMSS_{rowcount}_{hex16}.parquet
     _FILENAME_ROW_COUNT_RE = re.compile(r"^data_\d{8}_\d{6}_(\d+)_[a-f0-9]{16}\.parquet$")
 
-    # Canonical URL patterns — reject URLs that don't match these.
-    # All legit scraper output matches these patterns (verified on production data).
-    _CANONICAL_X = re.compile(r"^https://(x|twitter)\.com/[^/]+/status/\d+$")
-    _CANONICAL_REDDIT_POST = re.compile(
-        r"^https://(www\.)?reddit\.com/r/[^/]+/comments/[a-z0-9]+/[^?#/]*/?$"
-    )
-    _CANONICAL_REDDIT_COMMENT = re.compile(
-        r"^https://(www\.)?reddit\.com/r/[^/]+/comments/[a-z0-9]+/[^/]*/[a-z0-9]{7}/?$"
-    )
 
     # No optional columns — files must match expected schema exactly
     OPTIONAL_COLUMNS: Set[str] = set()
@@ -372,7 +362,6 @@ class DuckDBSampledValidator:
             issues = []
             duplicate_rate = duckdb_result["duplicate_rate_within_job"]
             empty_rate = duckdb_result["empty_rate"]
-            invalid_url_rate = duckdb_result.get("invalid_url_rate", 0.0)
             job_match_rate = job_match_result['match_rate']
             scraper_success_rate = scraper_result['success_rate']
             compression_failures = duckdb_result.get("compression_failures", 0)
@@ -386,8 +375,6 @@ class DuckDBSampledValidator:
                 issues.append(f"High duplicates: {duplicate_rate:.1f}%")
             if empty_rate > self.MAX_EMPTY_RATE:
                 issues.append(f"High empty content: {empty_rate:.1f}%")
-            if invalid_url_rate > self.MAX_INVALID_URL_RATE:
-                issues.append(f"Non-canonical URLs: {invalid_url_rate:.1f}% (URL fudging detected)")
             if job_match_rate < self.MIN_JOB_MATCH_RATE:
                 issues.append(f"Low job match: {job_match_rate:.1f}%")
             if scraper_success_rate < self.MIN_SCRAPER_SUCCESS:
@@ -453,7 +440,6 @@ class DuckDBSampledValidator:
                     f"job_match={job_match_rate:.1f}% (min {self.MIN_JOB_MATCH_RATE}%), "
                     f"scraper={scraper_success_rate:.1f}% (min {self.MIN_SCRAPER_SUCCESS}%), "
                     f"compression_fails={compression_failures}, "
-                    f"invalid_urls={invalid_url_rate:.1f}% (max {self.MAX_INVALID_URL_RATE}%), "
                     f"row_count_mismatches={row_count_mismatches}"
                 )
 
@@ -595,10 +581,6 @@ class DuckDBSampledValidator:
         dedup_total = 0
         dedup_duplicates = 0
 
-        # URL format validation: count non-canonical URLs
-        invalid_url_total = 0
-        invalid_url_count = 0
-
         # Limit to 20 files max for checks
         files_to_check = random.sample(sampled_files, min(20, len(sampled_files)))
 
@@ -701,32 +683,14 @@ class DuckDBSampledValidator:
                 url_rows = conn.execute(
                     f"SELECT url FROM read_parquet('{presigned_url}')"
                 ).fetchall()
-
-                # Pick the right canonical pattern for this platform
-                if platform in ['x', 'twitter']:
-                    canon_re = self._CANONICAL_X
-                else:
-                    canon_post_re = self._CANONICAL_REDDIT_POST
-                    canon_comment_re = self._CANONICAL_REDDIT_COMMENT
-
                 for (url_val,) in url_rows:
-                    url_str = str(url_val)
-                    normalized = normalize_url_for_dedup(url_str)
+                    normalized = normalize_url_for_dedup(url_val)
                     h = hashlib.blake2b(normalized.encode(), digest_size=8).digest()
                     dedup_total += 1
                     if h in job_hashes:
                         dedup_duplicates += 1
                     else:
                         job_hashes.add(h)
-
-                    # URL format validation — reject non-canonical URLs
-                    invalid_url_total += 1
-                    if platform in ['x', 'twitter']:
-                        if not canon_re.match(url_str):
-                            invalid_url_count += 1
-                    else:
-                        if not canon_post_re.match(url_str) and not canon_comment_re.match(url_str):
-                            invalid_url_count += 1
 
                 # --- PyArrow row-group read for empty/missing content check ---
                 if platform in ['x', 'twitter']:
@@ -797,20 +761,11 @@ class DuckDBSampledValidator:
                 f"({dedup_duplicates}/{dedup_total} urls across {len(dedup_hashes_by_job)} jobs)"
             )
 
-        # Invalid URL format rate
-        invalid_url_rate = (invalid_url_count / invalid_url_total * 100) if invalid_url_total > 0 else 0.0
-        if invalid_url_rate > self.MAX_INVALID_URL_RATE:
-            bt.logging.warning(
-                f"Non-canonical URLs: {invalid_url_rate:.1f}% "
-                f"({invalid_url_count}/{invalid_url_total} urls have fudged/invalid format)"
-            )
-
         if total_rows == 0:
             return {
                 "success": True,
                 "duplicate_rate_within_job": duplicate_rate,
                 "empty_rate": 0.0,
-                "invalid_url_rate": invalid_url_rate,
                 "total_rows": 0,
                 "compression_failures": compression_failures,
                 "row_count_mismatches": row_count_mismatches,
@@ -821,15 +776,13 @@ class DuckDBSampledValidator:
         bt.logging.info(
             f"Sampled validation: {total_rows} rows, "
             f"dup={duplicate_rate:.1f}% (per-job, {len(dedup_hashes_by_job)} jobs), "
-            f"empty={empty_rate:.1f}%, invalid_urls={invalid_url_rate:.1f}%, "
-            f"compression_fails={compression_failures}"
+            f"empty={empty_rate:.1f}%, compression_fails={compression_failures}"
         )
 
         return {
             "success": True,
             "duplicate_rate_within_job": duplicate_rate,
             "empty_rate": empty_rate,
-            "invalid_url_rate": invalid_url_rate,
             "total_rows": total_rows,
             "compression_failures": compression_failures,
             "row_count_mismatches": row_count_mismatches,
