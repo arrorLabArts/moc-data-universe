@@ -27,6 +27,57 @@ from scraping.reddit.model import RedditContent
 from common.data import DataEntity, DataSource
 from common.api_client import TaoSigner
 from vali_utils.parquet_reader import read_random_row_group
+from urllib.parse import urlparse
+
+
+def normalize_url_for_dedup(url_str: str) -> str:
+    """Platform-aware URL normalization that extracts the canonical content ID for dedup.
+
+    Approach: define what a VALID canonical URL looks like, ignore everything else.
+    This is not a blacklist of known exploits — it's a whitelist of valid URL structure.
+
+    X:      Only the numeric tweet ID matters. Username is lowercased (decorative — X resolves by ID).
+    Reddit: Only post_id and comment_id (base36, exactly 7 chars) matter.
+
+    Canonical forms produced:
+      X tweet:        https://x.com/{user_lower}/status/{tweet_id}
+      Reddit post:    https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}
+      Reddit comment: https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}/{comment_id}
+    """
+    url = str(url_str).strip()
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+    path = parsed.path
+
+    # --- X / Twitter ---
+    if "x.com" in netloc or "twitter.com" in netloc:
+        # Extract /username/status/DIGITS — lowercase username to prevent case-fudging
+        m = re.match(r"^/([^/]+)/status/(\d+)", path)
+        if m:
+            username = m.group(1).lower()
+            tweet_id = m.group(2)
+            return f"https://x.com/{username}/status/{tweet_id}"
+        return f"https://x.com{path.rstrip('/').lower()}"
+
+    # --- Reddit ---
+    if "reddit.com" in netloc:
+        # /r/{sub}/comments/{post_id}/{slug}/{comment_id}
+        m = re.match(
+            r"^/r/([^/]+)/comments/([a-z0-9]+)(?:/([^/]*)(?:/([a-z0-9]+))?)?",
+            path,
+        )
+        if m:
+            sub, post_id, slug, comment_id = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+            # Real Reddit IDs are base36, exactly 7 chars (post and comment).
+            # Verified against 240K+ real comment IDs and 704 post IDs — all 7 chars.
+            # Fake IDs (f1, _f1, aaaaaa0, etc.) fail this check.
+            if comment_id and re.match(r"^[a-z0-9]{7}$", comment_id):
+                return f"https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}/{comment_id}"
+            return f"https://www.reddit.com/r/{sub}/comments/{post_id}/{slug}"
+        return f"https://www.reddit.com{path.rstrip('/')}"
+
+    # --- Fallback: strip query/fragment, lowercase ---
+    return f"{parsed.scheme}://{netloc}{path.rstrip('/')}"
 
 
 @dataclass
@@ -92,15 +143,16 @@ class DuckDBSampledValidator:
     MAX_EMPTY_RATE = 10.0       # 10% max empty content
     # Missing URLs = instant fail (no rate threshold needed)
     MIN_JOB_MATCH_RATE = 95.0   # 95% min job content match rate
-    MIN_SCRAPER_SUCCESS = 70.0  # 70% min scraper success rate
+    MIN_SCRAPER_SUCCESS = 80.0  # 80% min scraper success rate
 
     # File size limits - prevent empty file exploit and oversized file OOM
     MIN_FILE_SIZE_BYTES = 15_000                   # 15KB - empty parquet header ≈ 8KB
     MAX_FILE_SIZE_BYTES = 512 * 1024 * 1024        # 512MB - single file cap
+    MIN_BYTES_PER_ROW = 50                         # Legit: 80-1300 B/row. Exploits: 8-25 B/row.
 
     # Scraper validation window — only files uploaded within this window are scraper-validated.
     # Older files rely on credibility from previous validation cycles.
-    SCRAPER_MAX_AGE_HOURS = 6
+    SCRAPER_MAX_AGE_HOURS = 24
 
     # Standard bytes per row for effective_size cap.
     # Real production data: X=77-515 B/row, Reddit=182-1682 B/row.
@@ -108,6 +160,7 @@ class DuckDBSampledValidator:
 
     # Filename pattern: data_YYYYMMDD_HHMMSS_{rowcount}_{hex16}.parquet
     _FILENAME_ROW_COUNT_RE = re.compile(r"^data_\d{8}_\d{6}_(\d+)_[a-f0-9]{16}\.parquet$")
+
 
     # No optional columns — files must match expected schema exactly
     OPTIONAL_COLUMNS: Set[str] = set()
@@ -168,10 +221,11 @@ class DuckDBSampledValidator:
             if not all_files:
                 return self._create_failed_result("No files found")
 
-            # Group files by job, filtering out empty/oversized files
+            # Group files by job, filtering out empty/oversized/suspicious files
             files_by_job = {}
             empty_files_skipped = 0
             oversized_files_skipped = 0
+            low_bpr_files_skipped = 0
             for f in all_files:
                 key = f.get('key', '')
                 if '/job_id=' in key:
@@ -187,6 +241,12 @@ class DuckDBSampledValidator:
                     if filename_rows is not None and filename_rows == 0:
                         empty_files_skipped += 1
                         continue
+                    # Skip suspiciously compressed files (duplicated content compresses to <50 B/row)
+                    if filename_rows is not None and filename_rows > 0:
+                        bpr = file_size / filename_rows
+                        if bpr < self.MIN_BYTES_PER_ROW:
+                            low_bpr_files_skipped += 1
+                            continue
                     job_id = key.split('/job_id=')[1].split('/')[0]
                     if job_id not in files_by_job:
                         files_by_job[job_id] = []
@@ -228,6 +288,11 @@ class DuckDBSampledValidator:
                 bt.logging.warning(
                     f"{miner_hotkey}: {oversized_files_skipped} oversized files skipped "
                     f"(> {self.MAX_FILE_SIZE_BYTES/(1024*1024):.0f}MB)"
+                )
+            if low_bpr_files_skipped > 0:
+                bt.logging.warning(
+                    f"{miner_hotkey}: {low_bpr_files_skipped} suspiciously compressed files skipped "
+                    f"(< {self.MIN_BYTES_PER_ROW} B/row)"
                 )
 
             bt.logging.info(
@@ -297,7 +362,7 @@ class DuckDBSampledValidator:
                         f"recent files (uploaded within {self.SCRAPER_MAX_AGE_HOURS}h)..."
                     )
                     scraper_result = await self._perform_scraper_validation(
-                        miner_hotkey, recent_files, expected_jobs, presigned_urls, num_entities=10
+                        miner_hotkey, recent_files, expected_jobs, presigned_urls, num_entities=15
                     )
                 else:
                     bt.logging.info(
@@ -632,7 +697,8 @@ class DuckDBSampledValidator:
                     f"SELECT url FROM read_parquet('{presigned_url}')"
                 ).fetchall()
                 for (url_val,) in url_rows:
-                    h = hashlib.blake2b(str(url_val).encode(), digest_size=8).digest()
+                    normalized = normalize_url_for_dedup(url_val)
+                    h = hashlib.blake2b(normalized.encode(), digest_size=8).digest()
                     dedup_total += 1
                     if h in job_hashes:
                         dedup_duplicates += 1
