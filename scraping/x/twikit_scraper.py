@@ -35,37 +35,56 @@ class TwikitTwitterScraper(Scraper):
     SCRAPE_TIMEOUT_SECS = 120
     concurrent_validates_semaphore = threading.BoundedSemaphore(5)
 
+    # Shared client across all instances (singleton pattern)
+    _shared_client = None
+    _shared_login_lock = None
+    _shared_logged_in = False
+    _shared_rate_lock = None
+    _last_request_time = 0
+    MIN_REQUEST_INTERVAL = 2.0  # seconds between API calls
+
     def __init__(self):
-        self._client = None
-        self._login_lock = asyncio.Lock()
-        self._logged_in = False
+        # Initialize class-level locks once
+        if TwikitTwitterScraper._shared_login_lock is None:
+            TwikitTwitterScraper._shared_login_lock = asyncio.Lock()
+        if TwikitTwitterScraper._shared_rate_lock is None:
+            TwikitTwitterScraper._shared_rate_lock = asyncio.Lock()
+
+    async def _rate_limit(self):
+        """Simple rate limiter to avoid 429 errors."""
+        async with TwikitTwitterScraper._shared_rate_lock:
+            import time
+            now = time.time()
+            elapsed = now - TwikitTwitterScraper._last_request_time
+            if elapsed < self.MIN_REQUEST_INTERVAL:
+                await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+            TwikitTwitterScraper._last_request_time = time.time()
 
     async def _get_client(self):
-        """Get or create an authenticated twikit client."""
-        if self._client is not None and self._logged_in:
-            return self._client
+        """Get or create an authenticated twikit client (shared singleton)."""
+        if TwikitTwitterScraper._shared_client is not None and TwikitTwitterScraper._shared_logged_in:
+            return TwikitTwitterScraper._shared_client
 
-        async with self._login_lock:
+        async with TwikitTwitterScraper._shared_login_lock:
             # Double-check after acquiring lock
-            if self._client is not None and self._logged_in:
-                return self._client
+            if TwikitTwitterScraper._shared_client is not None and TwikitTwitterScraper._shared_logged_in:
+                return TwikitTwitterScraper._shared_client
 
             from twikit import Client
 
-            self._client = Client("en-US")
+            client = Client("en-US")
 
             # Try loading saved cookies first
             if os.path.exists(COOKIES_FILE):
                 try:
-                    self._client.load_cookies(COOKIES_FILE)
-                    self._logged_in = True
+                    client.load_cookies(COOKIES_FILE)
                     bt.logging.success("Loaded twikit cookies from file")
 
                     # Pre-init ClientTransaction from cached homepage
                     # to avoid Cloudflare blocks on server
                     if os.path.exists(HOMEPAGE_CACHE_FILE):
                         try:
-                            await self._init_transaction_from_cache()
+                            await self._init_transaction_from_cache(client)
                             bt.logging.success(
                                 "Loaded cached homepage for ClientTransaction"
                             )
@@ -75,7 +94,9 @@ class TwikitTwitterScraper(Scraper):
                                 f"{traceback.format_exc()}"
                             )
 
-                    return self._client
+                    TwikitTwitterScraper._shared_client = client
+                    TwikitTwitterScraper._shared_logged_in = True
+                    return client
                 except Exception:
                     bt.logging.warning(
                         "Failed to load cookies, will re-login"
@@ -92,18 +113,19 @@ class TwikitTwitterScraper(Scraper):
                     "for the twikit scraper"
                 )
 
-            await self._client.login(
+            await client.login(
                 auth_info_1=username,
                 auth_info_2=email,
                 password=password,
             )
-            self._client.save_cookies(COOKIES_FILE)
-            self._logged_in = True
+            client.save_cookies(COOKIES_FILE)
+            TwikitTwitterScraper._shared_client = client
+            TwikitTwitterScraper._shared_logged_in = True
             bt.logging.success(f"Logged into X as @{username}")
 
-            return self._client
+            return client
 
-    async def _init_transaction_from_cache(self):
+    async def _init_transaction_from_cache(self, client):
         """Initialize ClientTransaction using cached homepage HTML."""
         import bs4
 
@@ -111,18 +133,18 @@ class TwikitTwitterScraper(Scraper):
             html = f.read()
 
         home_page = bs4.BeautifulSoup(html, "lxml")
-        ct = self._client.client_transaction
+        ct = client.client_transaction
         ct.home_page_response = home_page
 
         headers = {
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
             "Referer": "https://x.com",
-            "User-Agent": self._client._user_agent,
+            "User-Agent": client._user_agent,
         }
 
         ct.DEFAULT_ROW_INDEX, ct.DEFAULT_KEY_BYTES_INDICES = (
-            await ct.get_indices(home_page, self._client.http, headers)
+            await ct.get_indices(home_page, client.http, headers)
         )
         ct.key = ct.get_key(response=home_page)
         ct.key_bytes = ct.get_key_bytes(key=ct.key)
@@ -246,6 +268,7 @@ class TwikitTwitterScraper(Scraper):
                 # Extract tweet ID from URL
                 tweet_id = entity.uri.rstrip("/").split("/")[-1].split("?")[0]
 
+                await self._rate_limit()
                 tweet = await client.get_tweet_by_id(tweet_id)
                 if not tweet:
                     return ValidationResult(
@@ -360,6 +383,7 @@ class TwikitTwitterScraper(Scraper):
         bt.logging.success(f"Performing twikit scrape for: {query}")
 
         try:
+            await self._rate_limit()
             search_result = await client.search_tweet(
                 query, product="Latest", count=min(max_items, 20)
             )
@@ -368,8 +392,8 @@ class TwikitTwitterScraper(Scraper):
                 f"Failed to search tweets for {query}: {traceback.format_exc()}"
             )
             # Re-login on auth failure
-            self._logged_in = False
-            self._client = None
+            TwikitTwitterScraper._shared_logged_in = False
+            TwikitTwitterScraper._shared_client = None
             return []
 
         data_entities = []
@@ -467,6 +491,7 @@ class TwikitTwitterScraper(Scraper):
             bt.logging.info(f"On-demand twikit scrape for URL: {url}")
 
             try:
+                await self._rate_limit()
                 tweet = await client.get_tweet_by_id(tweet_id)
                 if not tweet:
                     return []
@@ -525,6 +550,7 @@ class TwikitTwitterScraper(Scraper):
         bt.logging.success(f"On-demand twikit scrape for: {query}")
 
         try:
+            await self._rate_limit()
             search_result = await client.search_tweet(
                 query, product="Latest", count=min(limit, 20)
             )
@@ -532,8 +558,8 @@ class TwikitTwitterScraper(Scraper):
             bt.logging.error(
                 f"Failed on-demand search {query}: {traceback.format_exc()}"
             )
-            self._logged_in = False
-            self._client = None
+            TwikitTwitterScraper._shared_logged_in = False
+            TwikitTwitterScraper._shared_client = None
             return []
 
         data_entities = []
