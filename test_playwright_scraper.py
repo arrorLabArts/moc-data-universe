@@ -1,54 +1,58 @@
-"""Test: compare popular vs niche queries to verify scraper works"""
+"""Test: does reusing browser context cause empty results?
+Simulates exactly what the miner does - one context, many sequential searches."""
 import asyncio
 import json
-import time
+from urllib.parse import quote
 from playwright.async_api import async_playwright
 
 COOKIES_FILE = "twikit_cookies.json"
 
 
 async def search(context, query):
-    """Search and return tweet count."""
-    from urllib.parse import quote
-
     page = await context.new_page()
     captured = {}
     event = asyncio.Event()
 
     async def on_response(response):
-        if "SearchTimeline" in response.url and response.status == 200:
+        if "SearchTimeline" in response.url:
             try:
-                captured["data"] = await response.json()
+                if response.status == 200:
+                    captured["data"] = await response.json()
+                else:
+                    captured["status"] = response.status
                 event.set()
             except Exception:
                 event.set()
 
     page.on("response", on_response)
-
     url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
     try:
         await asyncio.wait_for(event.wait(), timeout=15)
     except asyncio.TimeoutError:
-        pass
+        title = await page.title()
+        print(f"    TIMEOUT! title='{title}' url='{page.url}'")
 
-    tweet_count = 0
+    await page.close()
+
+    if "status" in captured:
+        return -1  # non-200 status
+
+    count = 0
     data = captured.get("data", {})
-    instructions = (
+    insts = (
         data.get("data", {})
         .get("search_by_raw_query", {})
         .get("search_timeline", {})
         .get("timeline", {})
         .get("instructions", [])
     )
-    for inst in instructions:
+    for inst in insts:
         for entry in inst.get("entries", []):
             if "tweet-" in entry.get("entryId", ""):
-                tweet_count += 1
-
-    await page.close()
-    return tweet_count
+                count += 1
+    return count
 
 
 async def main():
@@ -75,21 +79,26 @@ async def main():
     await context.add_cookies(pw_cookies)
     await context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
 
-    # Queries to test - mix of popular and actual on-demand queries from logs
+    # Simulate miner: many searches on the same context with 5s gaps
     queries = [
-        "bitcoin",
-        "#TAO",
-        "since:2026-03-27 until:2026-03-28 (from:Cupseyy)",
-        'since:2026-03-21 until:2026-03-28 ("#SN63" OR "#TAO" OR "Quantum Innovate")',
-        'since:2026-03-27 until:2026-03-28 ("$SOL" OR "solana memecoin")',
-        "since:2026-03-27 until:2026-03-28 (from:ApesPro_)",
+        "bitcoin",                          # popular - should always work
+        "#Bittensor",                       # should have results
+        "$TAO",                             # cashtag
+        'since:2026-03-02 until:2026-03-28 (from:gittensor_io)',  # you showed this works
+        "bitcoin",                          # repeat - still work?
+        "#Bittensor",                       # repeat
+        "bitcoin",                          # 3rd time
+        'since:2026-03-21 until:2026-03-28 ("#SN34" OR "$TAO" OR "BitMind")',
+        "bitcoin",                          # 4th time - still working?
+        "$TAO",                             # repeat
     ]
 
-    for query in queries:
-        await asyncio.sleep(3)  # rate limit
+    print("=== Reusing ONE context (like the miner) ===")
+    for i, query in enumerate(queries):
+        await asyncio.sleep(5)  # same rate limit as miner
         count = await search(context, query)
-        status = "OK" if count > 0 else "EMPTY"
-        print(f"  [{status}] {count:3d} tweets | {query}")
+        status = "OK" if count > 0 else ("ERR" if count < 0 else "EMPTY")
+        print(f"  [{status}] #{i+1:2d} {count:3d} tweets | {query}")
 
     await browser.close()
     await p.stop()

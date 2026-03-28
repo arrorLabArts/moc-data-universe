@@ -3,6 +3,9 @@ Custom X/Twitter scraper using Playwright headless browser.
 Navigates to x.com search/tweet pages and intercepts GraphQL API responses.
 Bypasses Cloudflare because it runs a real Chromium browser.
 Requires browser cookies in twikit_cookies.json (auth_token, ct0, etc).
+
+All requests go through a single queue processed one at a time with a
+10-second cooldown between requests to avoid rate limiting.
 """
 
 import asyncio
@@ -14,7 +17,7 @@ import threading
 import datetime as dt
 import bittensor as bt
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from common.data import DataEntity, DataLabel, DataSource
 from common.protocol import KeywordMode
@@ -26,31 +29,40 @@ from scraping.x import utils
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 COOKIES_FILE = os.path.join(PROJECT_ROOT, "twikit_cookies.json")
 
+COOLDOWN_SECONDS = 10.0
+
+
+class _QueueRequest:
+    """A request to be processed by the queue worker."""
+
+    def __init__(self, kind: str, **kwargs):
+        self.kind = kind  # "search" or "detail"
+        self.kwargs = kwargs
+        self.future: asyncio.Future = asyncio.get_event_loop().create_future()
+
 
 class TwikitTwitterScraper(Scraper):
     """
     Scrapes tweets using Playwright headless Chromium.
-    Navigates to x.com pages and intercepts the GraphQL API responses
-    that the browser makes naturally, bypassing all anti-bot measures.
+    All Twitter requests go through a single queue processed sequentially
+    with a 10-second cooldown between requests.
     """
 
     SCRAPE_TIMEOUT_SECS = 120
     concurrent_validates_semaphore = threading.BoundedSemaphore(5)
+    MAX_RETRIES = 3
 
-    # Shared browser state across all instances
+    # Shared state across all instances
     _browser = None
     _context = None
+    _playwright = None
     _browser_lock = None
-    _request_semaphore = None  # Only 1 page open at a time
-    _last_request_time = 0
-    MIN_REQUEST_INTERVAL = 5.0
-    MAX_RETRIES = 3
+    _queue: Optional[asyncio.Queue] = None
+    _worker_started = False
 
     def __init__(self):
         if TwikitTwitterScraper._browser_lock is None:
             TwikitTwitterScraper._browser_lock = asyncio.Lock()
-        if TwikitTwitterScraper._request_semaphore is None:
-            TwikitTwitterScraper._request_semaphore = asyncio.Semaphore(1)
 
     @staticmethod
     def _load_cookies_raw() -> dict:
@@ -80,7 +92,7 @@ class TwikitTwitterScraper(Scraper):
         return pw_cookies
 
     async def _ensure_browser(self):
-        """Ensure browser and context are initialized (singleton)."""
+        """Ensure browser, context, and queue worker are running."""
         if TwikitTwitterScraper._context is not None:
             return TwikitTwitterScraper._context
 
@@ -118,7 +130,6 @@ class TwikitTwitterScraper(Scraper):
 
             await context.add_cookies(pw_cookies)
 
-            # Remove webdriver flag
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
@@ -128,17 +139,138 @@ class TwikitTwitterScraper(Scraper):
             TwikitTwitterScraper._browser = browser
             TwikitTwitterScraper._context = context
             TwikitTwitterScraper._playwright = p
+            TwikitTwitterScraper._queue = asyncio.Queue()
 
             bt.logging.success("Playwright browser launched and cookies loaded")
+
+            # Start the queue worker
+            asyncio.create_task(self._queue_worker())
+            TwikitTwitterScraper._worker_started = True
+
+            # Startup self-test
+            try:
+                result = await self._do_search("bitcoin")
+                bt.logging.success(
+                    f"Startup self-test PASSED: found {len(result)} tweets "
+                    f"for 'bitcoin'"
+                )
+            except Exception as e:
+                bt.logging.warning(f"Startup self-test failed: {e}")
+
             return context
 
-    async def _rate_limit_wait(self):
-        """Wait for rate limit interval (call while holding semaphore)."""
-        now = time.time()
-        elapsed = now - TwikitTwitterScraper._last_request_time
-        if elapsed < self.MIN_REQUEST_INTERVAL:
-            await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
-        TwikitTwitterScraper._last_request_time = time.time()
+    async def _queue_worker(self):
+        """Background worker: processes one request at a time with cooldown."""
+        bt.logging.info("X scraper queue worker started")
+        queue = TwikitTwitterScraper._queue
+
+        while True:
+            try:
+                req = await queue.get()
+
+                bt.logging.debug(
+                    f"Queue worker processing {req.kind} request "
+                    f"(queue size: {queue.qsize()})"
+                )
+
+                try:
+                    if req.kind == "search":
+                        result = await self._do_search(req.kwargs["query"])
+                        req.future.set_result(result)
+                    elif req.kind == "detail":
+                        result = await self._do_tweet_detail(
+                            req.kwargs["tweet_id"],
+                            req.kwargs.get("tweet_url"),
+                        )
+                        req.future.set_result(result)
+                    else:
+                        req.future.set_result(None)
+                except Exception as e:
+                    req.future.set_exception(e)
+
+                queue.task_done()
+
+                # Cooldown AFTER the request completes
+                bt.logging.debug(
+                    f"Request done. Cooling down {COOLDOWN_SECONDS}s..."
+                )
+                await asyncio.sleep(COOLDOWN_SECONDS)
+
+            except Exception:
+                bt.logging.error(
+                    f"Queue worker error: {traceback.format_exc()}"
+                )
+                await asyncio.sleep(5)
+
+    async def _enqueue(self, kind: str, **kwargs) -> Any:
+        """Submit a request to the queue and wait for the result."""
+        await self._ensure_browser()
+
+        req = _QueueRequest(kind, **kwargs)
+        await TwikitTwitterScraper._queue.put(req)
+
+        queue_size = TwikitTwitterScraper._queue.qsize()
+        if queue_size > 1:
+            bt.logging.debug(f"Queued {kind} request (position: {queue_size})")
+
+        return await req.future
+
+    async def _do_search(self, query: str) -> list:
+        """Actually perform a search (called by queue worker only)."""
+        from urllib.parse import quote
+
+        search_url = (
+            f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
+        )
+
+        bt.logging.info(f"Playwright search: {query}")
+        data = await self._intercept_api_response(
+            search_url, "SearchTimeline", timeout_ms=45000
+        )
+
+        if not data:
+            bt.logging.warning("No SearchTimeline response captured")
+            return []
+
+        tweets = self._extract_tweets_from_timeline(data)
+        if not tweets:
+            try:
+                bt.logging.warning(
+                    f"SearchTimeline returned 0 tweets. "
+                    f"Response preview: "
+                    f"{json.dumps(data, default=str)[:500]}"
+                )
+            except Exception:
+                pass
+        else:
+            bt.logging.success(
+                f"Search returned {len(tweets)} tweets for: {query}"
+            )
+        return tweets
+
+    async def _do_tweet_detail(
+        self, tweet_id: str, tweet_url: str = None
+    ) -> Optional[dict]:
+        """Actually fetch a tweet detail (called by queue worker only)."""
+        if not tweet_url:
+            tweet_url = f"https://x.com/i/status/{tweet_id}"
+
+        bt.logging.info(f"Playwright tweet detail: {tweet_id}")
+        data = await self._intercept_api_response(
+            tweet_url, "TweetDetail", timeout_ms=30000
+        )
+
+        if not data:
+            bt.logging.warning(
+                f"No TweetDetail response captured for {tweet_id}"
+            )
+            return None
+
+        tweets = self._extract_tweets_from_detail(data)
+        for t in tweets:
+            if t.get("rest_id") == tweet_id:
+                return t
+        return tweets[0] if tweets else None
 
     async def _intercept_api_response(
         self, url: str, api_pattern: str, timeout_ms: int = 30000
@@ -147,7 +279,7 @@ class TwikitTwitterScraper(Scraper):
         Navigate to a URL and intercept the matching API response.
         Returns the parsed JSON from the intercepted response.
         """
-        context = await self._ensure_browser()
+        context = TwikitTwitterScraper._context
         page = await context.new_page()
 
         captured_response = None
@@ -180,10 +312,10 @@ class TwikitTwitterScraper(Scraper):
         page.on("response", handle_response)
 
         try:
-            # Start navigation (don't wait for networkidle - Twitter never idles)
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await page.goto(
+                url, wait_until="domcontentloaded", timeout=timeout_ms
+            )
 
-            # Wait for the API response to be intercepted
             bt.logging.debug(
                 f"Page DOM loaded, waiting up to 20s for {api_pattern}..."
             )
@@ -222,62 +354,54 @@ class TwikitTwitterScraper(Scraper):
         finally:
             await page.close()
 
+    # ── Search / detail public methods (enqueue + retry) ──
+
     async def _search_tweets(self, query: str, count: int = 20) -> list:
-        """Search tweets by navigating to the search page (serialized)."""
-        from urllib.parse import quote
+        """Search tweets via the queue."""
+        return await self._enqueue("search", query=query)
 
-        search_url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
+    async def _get_tweet_detail(
+        self, tweet_id: str, tweet_url: str = None
+    ) -> Optional[dict]:
+        """Get tweet detail via the queue."""
+        return await self._enqueue(
+            "detail", tweet_id=tweet_id, tweet_url=tweet_url
+        )
 
-        # Only one Twitter request at a time across all instances
-        async with TwikitTwitterScraper._request_semaphore:
-            await self._rate_limit_wait()
-
-            bt.logging.debug(f"Playwright search: {query}")
-            data = await self._intercept_api_response(
-                search_url, "SearchTimeline", timeout_ms=45000
-            )
-
-        if not data:
-            bt.logging.warning("No SearchTimeline response captured")
-            return []
-
-        tweets = self._extract_tweets_from_timeline(data)
-        if not tweets:
-            # Debug: log response structure to diagnose parsing
+    async def _search_with_retry(self, query: str, count: int = 20) -> list:
+        """Search with retry on failure."""
+        for attempt in range(self.MAX_RETRIES):
             try:
-                import json as _json
-                bt.logging.warning(
-                    f"SearchTimeline returned 0 tweets. "
-                    f"Response preview: {_json.dumps(data, default=str)[:500]}"
-                )
+                results = await self._search_tweets(query, count)
+                if results:
+                    return results
+                if attempt < self.MAX_RETRIES - 1:
+                    bt.logging.warning(
+                        f"Search returned 0 results on attempt "
+                        f"{attempt + 1}/{self.MAX_RETRIES}, will retry"
+                    )
+                    # No extra sleep here — the queue worker already
+                    # enforces 10s cooldown between requests
             except Exception:
-                pass
-        return tweets
+                bt.logging.error(
+                    f"Search failed: {traceback.format_exc()}"
+                )
+        return []
 
-    async def _get_tweet_detail(self, tweet_id: str, tweet_url: str = None) -> Optional[dict]:
-        """Get a single tweet by navigating to its page (serialized)."""
-        if not tweet_url:
-            tweet_url = f"https://x.com/i/status/{tweet_id}"
+    async def _get_tweet_with_retry(self, tweet_id: str) -> Optional[dict]:
+        """Get tweet by ID with retry."""
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                result = await self._get_tweet_detail(tweet_id)
+                if result:
+                    return result
+            except Exception:
+                bt.logging.error(
+                    f"Get tweet failed: {traceback.format_exc()}"
+                )
+        return None
 
-        # Only one Twitter request at a time across all instances
-        async with TwikitTwitterScraper._request_semaphore:
-            await self._rate_limit_wait()
-
-            bt.logging.debug(f"Playwright tweet detail: {tweet_id}")
-            data = await self._intercept_api_response(
-                tweet_url, "TweetDetail", timeout_ms=30000
-            )
-
-        if not data:
-            bt.logging.warning(f"No TweetDetail response captured for {tweet_id}")
-            return None
-
-        tweets = self._extract_tweets_from_detail(data)
-        # Find the focal tweet
-        for t in tweets:
-            if t.get("rest_id") == tweet_id:
-                return t
-        return tweets[0] if tweets else None
+    # ── Response parsing ──
 
     def _extract_tweets_from_timeline(self, data: dict) -> list:
         """Extract tweet data from SearchTimeline response."""
@@ -302,7 +426,9 @@ class TwikitTwitterScraper(Scraper):
                             tweet_results = ic.get("tweet_results", {})
                             result = tweet_results.get("result", {})
                             if result:
-                                tweets.append(self._normalize_tweet_result(result))
+                                tweets.append(
+                                    self._normalize_tweet_result(result)
+                                )
                         continue
 
                     tweet_results = item_content.get("tweet_results", {})
@@ -310,7 +436,9 @@ class TwikitTwitterScraper(Scraper):
                     if result:
                         tweets.append(self._normalize_tweet_result(result))
         except Exception:
-            bt.logging.warning(f"Failed to extract tweets: {traceback.format_exc()}")
+            bt.logging.warning(
+                f"Failed to extract tweets: {traceback.format_exc()}"
+            )
         return [t for t in tweets if t is not None]
 
     def _extract_tweets_from_detail(self, data: dict) -> list:
@@ -331,14 +459,18 @@ class TwikitTwitterScraper(Scraper):
                         tweet_results = item_content.get("tweet_results", {})
                         result = tweet_results.get("result", {})
                         if result:
-                            tweets.append(self._normalize_tweet_result(result))
+                            tweets.append(
+                                self._normalize_tweet_result(result)
+                            )
                     items = content.get("items", [])
                     for item in items:
                         ic = item.get("item", {}).get("itemContent", {})
                         tweet_results = ic.get("tweet_results", {})
                         result = tweet_results.get("result", {})
                         if result:
-                            tweets.append(self._normalize_tweet_result(result))
+                            tweets.append(
+                                self._normalize_tweet_result(result)
+                            )
         except Exception:
             bt.logging.warning(
                 f"Failed to extract tweet detail: {traceback.format_exc()}"
@@ -364,7 +496,9 @@ class TwikitTwitterScraper(Scraper):
         except (ValueError, TypeError):
             return None
 
-    def _parse_raw_tweet_to_xcontent(self, tweet_data: dict) -> Optional[XContent]:
+    def _parse_raw_tweet_to_xcontent(
+        self, tweet_data: dict
+    ) -> Optional[XContent]:
         """Convert raw GraphQL tweet data to XContent."""
         try:
             legacy = tweet_data.get("legacy", {})
@@ -379,7 +513,6 @@ class TwikitTwitterScraper(Scraper):
                 return None
 
             url = f"https://x.com/{screen_name}/status/{tweet_id}"
-
             text = legacy.get("full_text", "")
 
             hashtags = []
@@ -400,14 +533,18 @@ class TwikitTwitterScraper(Scraper):
                     media_urls = None
 
             created_at = legacy.get("created_at", "")
-            timestamp = dt.datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            timestamp = dt.datetime.strptime(
+                created_at, "%a %b %d %H:%M:%S %z %Y"
+            )
 
             in_reply_to_status = legacy.get("in_reply_to_status_id_str")
             is_reply = in_reply_to_status is not None
             is_quote = legacy.get("is_quote_status", False)
 
             quoted_tweet_id = None
-            quoted = tweet_data.get("quoted_status_result", {}).get("result", {})
+            quoted = (
+                tweet_data.get("quoted_status_result", {}).get("result", {})
+            )
             if quoted:
                 quoted_tweet_id = quoted.get("rest_id")
 
@@ -430,7 +567,9 @@ class TwikitTwitterScraper(Scraper):
                 conversation_id=legacy.get("conversation_id_str"),
                 in_reply_to_user_id=legacy.get("in_reply_to_user_id_str"),
                 language=legacy.get("lang"),
-                in_reply_to_username=legacy.get("in_reply_to_screen_name"),
+                in_reply_to_username=legacy.get(
+                    "in_reply_to_screen_name"
+                ),
                 quoted_tweet_id=quoted_tweet_id,
                 like_count=legacy.get("favorite_count"),
                 retweet_count=legacy.get("retweet_count"),
@@ -443,53 +582,26 @@ class TwikitTwitterScraper(Scraper):
                 user_location=user_legacy.get("location") or None,
                 profile_image_url=user_legacy.get(
                     "profile_image_url_https"
-                ) or None,
-                cover_picture_url=user_legacy.get("profile_banner_url") or None,
+                )
+                or None,
+                cover_picture_url=user_legacy.get("profile_banner_url")
+                or None,
                 user_followers_count=user_legacy.get("followers_count"),
                 user_following_count=user_legacy.get("friends_count"),
                 scraped_at=dt.datetime.now(dt.timezone.utc),
             )
         except Exception:
-            bt.logging.warning(f"Failed to parse tweet: {traceback.format_exc()}")
+            bt.logging.warning(
+                f"Failed to parse tweet: {traceback.format_exc()}"
+            )
             return None
 
-    async def _search_with_retry(self, query: str, count: int = 20) -> list:
-        """Search with retry on failure."""
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                results = await self._search_tweets(query, count)
-                if results:
-                    return results
-                if attempt < self.MAX_RETRIES - 1:
-                    wait = 10 * (attempt + 1)
-                    bt.logging.warning(
-                        f"Search returned 0 results on attempt {attempt + 1}, "
-                        f"retrying in {wait}s"
-                    )
-                    await asyncio.sleep(wait)
-            except Exception:
-                bt.logging.error(f"Search failed: {traceback.format_exc()}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(10 * (attempt + 1))
-        return []
-
-    async def _get_tweet_with_retry(self, tweet_id: str) -> Optional[dict]:
-        """Get tweet by ID with retry."""
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                result = await self._get_tweet_detail(tweet_id)
-                if result:
-                    return result
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(10 * (attempt + 1))
-            except Exception:
-                bt.logging.error(f"Get tweet failed: {traceback.format_exc()}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(10 * (attempt + 1))
-        return None
+    # ── Public interface: validate, scrape, on_demand_scrape ──
 
     async def validate(
-        self, entities: List[DataEntity], allow_low_engagement: bool = False
+        self,
+        entities: List[DataEntity],
+        allow_low_engagement: bool = False,
     ) -> List[ValidationResult]:
         """Validate DataEntities by fetching the actual tweet."""
 
@@ -502,22 +614,30 @@ class TwikitTwitterScraper(Scraper):
                 )
 
             try:
-                tweet_id = entity.uri.rstrip("/").split("/")[-1].split("?")[0]
+                tweet_id = (
+                    entity.uri.rstrip("/").split("/")[-1].split("?")[0]
+                )
                 tweet_data = await self._get_tweet_with_retry(tweet_id)
 
                 if not tweet_data:
                     return ValidationResult(
                         is_valid=False,
                         reason="Tweet not found.",
-                        content_size_bytes_validated=entity.content_size_bytes,
+                        content_size_bytes_validated=(
+                            entity.content_size_bytes
+                        ),
                     )
 
-                actual_content = self._parse_raw_tweet_to_xcontent(tweet_data)
+                actual_content = self._parse_raw_tweet_to_xcontent(
+                    tweet_data
+                )
                 if not actual_content:
                     return ValidationResult(
                         is_valid=False,
                         reason="Failed to parse tweet.",
-                        content_size_bytes_validated=entity.content_size_bytes,
+                        content_size_bytes_validated=(
+                            entity.content_size_bytes
+                        ),
                     )
 
                 legacy = tweet_data.get("legacy", {})
@@ -541,13 +661,19 @@ class TwikitTwitterScraper(Scraper):
                         return ValidationResult(
                             is_valid=False,
                             reason="Tweet from spam account.",
-                            content_size_bytes_validated=entity.content_size_bytes,
+                            content_size_bytes_validated=(
+                                entity.content_size_bytes
+                            ),
                         )
-                    if utils.is_low_engagement_tweet({"viewCount": view_count}):
+                    if utils.is_low_engagement_tweet(
+                        {"viewCount": view_count}
+                    ):
                         return ValidationResult(
                             is_valid=False,
                             reason="Tweet has low engagement.",
-                            content_size_bytes_validated=entity.content_size_bytes,
+                            content_size_bytes_validated=(
+                                entity.content_size_bytes
+                            ),
                         )
 
                 return utils.validate_tweet_content(
@@ -560,7 +686,8 @@ class TwikitTwitterScraper(Scraper):
 
             except Exception:
                 bt.logging.error(
-                    f"Validation failed for {entity.uri}: {traceback.format_exc()}"
+                    f"Validation failed for {entity.uri}: "
+                    f"{traceback.format_exc()}"
                 )
                 return ValidationResult(
                     is_valid=False,
@@ -579,7 +706,9 @@ class TwikitTwitterScraper(Scraper):
         return results
 
     async def scrape(
-        self, scrape_config: ScrapeConfig, allow_low_engagement: bool = False
+        self,
+        scrape_config: ScrapeConfig,
+        allow_low_engagement: bool = False,
     ) -> List[DataEntity]:
         """Scrape tweets based on config."""
         query_parts = []
@@ -595,9 +724,13 @@ class TwikitTwitterScraper(Scraper):
                     keyword_labels.append(label.value)
 
             if username_labels:
-                query_parts.append(f"({' OR '.join(username_labels)})")
+                query_parts.append(
+                    f"({' OR '.join(username_labels)})"
+                )
             if keyword_labels:
-                query_parts.append(f"({' OR '.join(keyword_labels)})")
+                query_parts.append(
+                    f"({' OR '.join(keyword_labels)})"
+                )
         else:
             query_parts.append("e")
 
@@ -614,7 +747,9 @@ class TwikitTwitterScraper(Scraper):
 
         bt.logging.success(f"Performing X scrape for: {query}")
 
-        raw_tweets = await self._search_with_retry(query, min(max_items, 20))
+        raw_tweets = await self._search_with_retry(
+            query, min(max_items, 20)
+        )
 
         data_entities = []
         for tweet_data in raw_tweets[:max_items]:
@@ -636,13 +771,18 @@ class TwikitTwitterScraper(Scraper):
                     continue
                 views = tweet_data.get("views", {})
                 view_count = self._safe_int(views.get("count")) or 0
-                if utils.is_low_engagement_tweet({"viewCount": view_count}):
+                if utils.is_low_engagement_tweet(
+                    {"viewCount": view_count}
+                ):
                     continue
 
-            data_entities.append(XContent.to_data_entity(content=x_content))
+            data_entities.append(
+                XContent.to_data_entity(content=x_content)
+            )
 
         bt.logging.success(
-            f"Completed X scrape for {query}. Scraped {len(data_entities)} items."
+            f"Completed X scrape for {query}. "
+            f"Scraped {len(data_entities)} items."
         )
         return data_entities
 
@@ -679,7 +819,8 @@ class TwikitTwitterScraper(Scraper):
                 return [XContent.to_data_entity(content=x_content)]
             except Exception:
                 bt.logging.error(
-                    f"Failed to fetch tweet {url}: {traceback.format_exc()}"
+                    f"Failed to fetch tweet {url}: "
+                    f"{traceback.format_exc()}"
                 )
                 return []
 
@@ -697,9 +838,13 @@ class TwikitTwitterScraper(Scraper):
         query_parts = []
 
         if start_datetime:
-            query_parts.append(f"since:{start_datetime.strftime('%Y-%m-%d')}")
+            query_parts.append(
+                f"since:{start_datetime.strftime('%Y-%m-%d')}"
+            )
         if end_datetime:
-            query_parts.append(f"until:{end_datetime.strftime('%Y-%m-%d')}")
+            query_parts.append(
+                f"until:{end_datetime.strftime('%Y-%m-%d')}"
+            )
 
         if usernames:
             username_queries = [
@@ -721,16 +866,21 @@ class TwikitTwitterScraper(Scraper):
 
         bt.logging.success(f"On-demand X scrape for: {query}")
 
-        raw_tweets = await self._search_with_retry(query, min(limit, 20))
+        raw_tweets = await self._search_with_retry(
+            query, min(limit, 20)
+        )
 
         data_entities = []
         for tweet_data in raw_tweets[:limit]:
             x_content = self._parse_raw_tweet_to_xcontent(tweet_data)
             if x_content is None:
                 continue
-            data_entities.append(XContent.to_data_entity(content=x_content))
+            data_entities.append(
+                XContent.to_data_entity(content=x_content)
+            )
 
         bt.logging.success(
-            f"On-demand X scrape completed. Found {len(data_entities)} items."
+            f"On-demand X scrape completed. "
+            f"Found {len(data_entities)} items."
         )
         return data_entities
