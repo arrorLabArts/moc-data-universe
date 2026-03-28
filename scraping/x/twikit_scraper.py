@@ -510,6 +510,11 @@ class TwikitTwitterScraper(Scraper):
             screen_name = user_legacy.get("screen_name", "")
 
             if not tweet_id or not screen_name:
+                bt.logging.debug(
+                    f"Skipping tweet: tweet_id='{tweet_id}', "
+                    f"screen_name='{screen_name}', "
+                    f"keys={list(tweet_data.keys())[:10]}"
+                )
                 return None
 
             url = f"https://x.com/{screen_name}/status/{tweet_id}"
