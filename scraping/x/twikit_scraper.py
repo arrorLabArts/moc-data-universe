@@ -504,17 +504,19 @@ class TwikitTwitterScraper(Scraper):
             legacy = tweet_data.get("legacy", {})
             core = tweet_data.get("core", {})
             user_results = core.get("user_results", {}).get("result", {})
+
+            # Twitter moved user fields from result.legacy to result.core
+            user_core = user_results.get("core", {})
             user_legacy = user_results.get("legacy", {})
 
             tweet_id = tweet_data.get("rest_id", "")
-            screen_name = user_legacy.get("screen_name", "")
+            # Try new path (result.core) first, fall back to old (result.legacy)
+            screen_name = (
+                user_core.get("screen_name", "")
+                or user_legacy.get("screen_name", "")
+            )
 
             if not tweet_id or not screen_name:
-                bt.logging.debug(
-                    f"Skipping tweet: tweet_id='{tweet_id}', "
-                    f"screen_name='{screen_name}', "
-                    f"core={json.dumps(core, default=str)[:300]}"
-                )
                 return None
 
             url = f"https://x.com/{screen_name}/status/{tweet_id}"
@@ -556,6 +558,19 @@ class TwikitTwitterScraper(Scraper):
             views = tweet_data.get("views", {})
             view_count = self._safe_int(views.get("count"))
 
+            # User display name: try new path, fall back to old
+            display_name = (
+                user_core.get("name", "")
+                or user_legacy.get("name", "")
+            )
+
+            # Avatar: try new avatar field, fall back to legacy
+            avatar = user_results.get("avatar", {})
+            profile_image = (
+                avatar.get("image_url")
+                or user_legacy.get("profile_image_url_https")
+            ) or None
+
             return XContent(
                 username=screen_name,
                 text=utils.sanitize_scraped_tweet(text),
@@ -564,7 +579,7 @@ class TwikitTwitterScraper(Scraper):
                 tweet_hashtags=hashtags,
                 media=media_urls,
                 user_id=user_results.get("rest_id"),
-                user_display_name=user_legacy.get("name"),
+                user_display_name=display_name or None,
                 user_verified=user_legacy.get("verified"),
                 tweet_id=tweet_id,
                 is_reply=is_reply,
@@ -585,10 +600,7 @@ class TwikitTwitterScraper(Scraper):
                 user_blue_verified=user_results.get("is_blue_verified"),
                 user_description=user_legacy.get("description") or None,
                 user_location=user_legacy.get("location") or None,
-                profile_image_url=user_legacy.get(
-                    "profile_image_url_https"
-                )
-                or None,
+                profile_image_url=profile_image,
                 cover_picture_url=user_legacy.get("profile_banner_url")
                 or None,
                 user_followers_count=user_legacy.get("followers_count"),
@@ -646,16 +658,20 @@ class TwikitTwitterScraper(Scraper):
                     )
 
                 legacy = tweet_data.get("legacy", {})
-                user_legacy = (
+                user_result = (
                     tweet_data.get("core", {})
                     .get("user_results", {})
                     .get("result", {})
-                    .get("legacy", {})
                 )
+                user_legacy = user_result.get("legacy", {})
+                user_core = user_result.get("core", {})
 
                 author_data = {
                     "followers": user_legacy.get("followers_count", 0),
-                    "createdAt": user_legacy.get("created_at"),
+                    "createdAt": (
+                        user_core.get("created_at")
+                        or user_legacy.get("created_at")
+                    ),
                 }
                 views = tweet_data.get("views", {})
                 view_count = self._safe_int(views.get("count")) or 0
