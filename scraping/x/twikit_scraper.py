@@ -41,7 +41,8 @@ class TwikitTwitterScraper(Scraper):
     _shared_logged_in = False
     _shared_rate_lock = None
     _last_request_time = 0
-    MIN_REQUEST_INTERVAL = 2.0  # seconds between API calls
+    MIN_REQUEST_INTERVAL = 5.0  # seconds between API calls
+    MAX_RETRIES = 3
 
     def __init__(self):
         # Initialize class-level locks once
@@ -59,6 +60,41 @@ class TwikitTwitterScraper(Scraper):
             if elapsed < self.MIN_REQUEST_INTERVAL:
                 await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
             TwikitTwitterScraper._last_request_time = time.time()
+
+    async def _search_with_retry(self, client, query, count):
+        """Search tweets with retry on rate limit."""
+        from twikit.errors import TooManyRequests
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                await self._rate_limit()
+                return await client.search_tweet(
+                    query, product="Latest", count=count
+                )
+            except TooManyRequests:
+                wait = 15 * (attempt + 1)  # 15s, 30s, 45s
+                bt.logging.warning(
+                    f"Rate limited on attempt {attempt + 1}, "
+                    f"waiting {wait}s before retry"
+                )
+                await asyncio.sleep(wait)
+        bt.logging.error(f"Failed after {self.MAX_RETRIES} retries for: {query}")
+        return None
+
+    async def _get_tweet_with_retry(self, client, tweet_id):
+        """Get tweet by ID with retry on rate limit."""
+        from twikit.errors import TooManyRequests
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                await self._rate_limit()
+                return await client.get_tweet_by_id(tweet_id)
+            except TooManyRequests:
+                wait = 15 * (attempt + 1)
+                bt.logging.warning(
+                    f"Rate limited fetching tweet {tweet_id}, "
+                    f"waiting {wait}s"
+                )
+                await asyncio.sleep(wait)
+        return None
 
     async def _get_client(self):
         """Get or create an authenticated twikit client (shared singleton)."""
@@ -268,12 +304,11 @@ class TwikitTwitterScraper(Scraper):
                 # Extract tweet ID from URL
                 tweet_id = entity.uri.rstrip("/").split("/")[-1].split("?")[0]
 
-                await self._rate_limit()
-                tweet = await client.get_tweet_by_id(tweet_id)
+                tweet = await self._get_tweet_with_retry(client, tweet_id)
                 if not tweet:
                     return ValidationResult(
                         is_valid=False,
-                        reason="Tweet not found.",
+                        reason="Tweet not found or rate limited.",
                         content_size_bytes_validated=entity.content_size_bytes,
                     )
 
@@ -382,18 +417,10 @@ class TwikitTwitterScraper(Scraper):
 
         bt.logging.success(f"Performing twikit scrape for: {query}")
 
-        try:
-            await self._rate_limit()
-            search_result = await client.search_tweet(
-                query, product="Latest", count=min(max_items, 20)
-            )
-        except Exception:
-            bt.logging.error(
-                f"Failed to search tweets for {query}: {traceback.format_exc()}"
-            )
-            # Re-login on auth failure
-            TwikitTwitterScraper._shared_logged_in = False
-            TwikitTwitterScraper._shared_client = None
+        search_result = await self._search_with_retry(
+            client, query, min(max_items, 20)
+        )
+        if search_result is None:
             return []
 
         data_entities = []
@@ -491,8 +518,7 @@ class TwikitTwitterScraper(Scraper):
             bt.logging.info(f"On-demand twikit scrape for URL: {url}")
 
             try:
-                await self._rate_limit()
-                tweet = await client.get_tweet_by_id(tweet_id)
+                tweet = await self._get_tweet_with_retry(client, tweet_id)
                 if not tweet:
                     return []
 
@@ -549,17 +575,10 @@ class TwikitTwitterScraper(Scraper):
 
         bt.logging.success(f"On-demand twikit scrape for: {query}")
 
-        try:
-            await self._rate_limit()
-            search_result = await client.search_tweet(
-                query, product="Latest", count=min(limit, 20)
-            )
-        except Exception:
-            bt.logging.error(
-                f"Failed on-demand search {query}: {traceback.format_exc()}"
-            )
-            TwikitTwitterScraper._shared_logged_in = False
-            TwikitTwitterScraper._shared_client = None
+        search_result = await self._search_with_retry(
+            client, query, min(limit, 20)
+        )
+        if search_result is None:
             return []
 
         data_entities = []
