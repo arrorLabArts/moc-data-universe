@@ -25,6 +25,7 @@ from scraping.x import utils
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 COOKIES_FILE = os.path.join(PROJECT_ROOT, "twikit_cookies.json")
+HOMEPAGE_CACHE_FILE = os.path.join(PROJECT_ROOT, "twikit_homepage.html")
 
 BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 
@@ -93,6 +94,8 @@ class TwikitTwitterScraper(Scraper):
     # Shared state across all instances
     _cookies = None
     _rate_lock = None
+    _transaction = None
+    _transaction_lock = None
     _last_request_time = 0
     MIN_REQUEST_INTERVAL = 3.0
     MAX_RETRIES = 3
@@ -100,6 +103,8 @@ class TwikitTwitterScraper(Scraper):
     def __init__(self):
         if TwikitTwitterScraper._rate_lock is None:
             TwikitTwitterScraper._rate_lock = asyncio.Lock()
+        if TwikitTwitterScraper._transaction_lock is None:
+            TwikitTwitterScraper._transaction_lock = asyncio.Lock()
 
     def _load_cookies(self):
         """Load cookies from file (cached across instances)."""
@@ -127,9 +132,94 @@ class TwikitTwitterScraper(Scraper):
                 await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
             TwikitTwitterScraper._last_request_time = time.time()
 
-    def _build_headers(self, cookies: dict) -> dict:
+    async def _get_transaction(self):
+        """Get or initialize the ClientTransaction for generating IDs."""
+        if TwikitTwitterScraper._transaction is not None:
+            return TwikitTwitterScraper._transaction
+
+        async with TwikitTwitterScraper._transaction_lock:
+            if TwikitTwitterScraper._transaction is not None:
+                return TwikitTwitterScraper._transaction
+
+            if not os.path.exists(HOMEPAGE_CACHE_FILE):
+                bt.logging.warning("No homepage cache - transaction IDs unavailable")
+                return None
+
+            try:
+                import bs4
+                from twikit.x_client_transaction import ClientTransaction
+                from curl_cffi.requests import AsyncSession
+
+                with open(HOMEPAGE_CACHE_FILE, "r", encoding="utf-8") as f:
+                    html = f.read()
+
+                home_page = bs4.BeautifulSoup(html, "lxml")
+                ct = ClientTransaction()
+                ct.home_page_response = home_page
+
+                # Fetch ondemand.s.js for key byte indices using curl_cffi
+                headers = {
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Referer": "https://x.com",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                }
+
+                import re
+                from twikit.x_client_transaction.transaction import (
+                    ON_DEMAND_FILE_REGEX, ON_DEMAND_HASH_PATTERN, INDICES_REGEX
+                )
+
+                response_text = str(home_page)
+                on_demand_file = ON_DEMAND_FILE_REGEX.search(response_text)
+                if not on_demand_file:
+                    bt.logging.warning("Could not find ondemand.s chunk in homepage")
+                    return None
+
+                chunk_index = on_demand_file.group(1)
+                hash_pattern = re.compile(ON_DEMAND_HASH_PATTERN.format(chunk_index))
+                hash_match = hash_pattern.search(response_text)
+                if not hash_match:
+                    bt.logging.warning("Could not find hash for ondemand.s chunk")
+                    return None
+
+                file_hash = hash_match.group(1)
+                js_url = f"https://abs.twimg.com/responsive-web/client-web/ondemand.s.{file_hash}a.js"
+
+                async with AsyncSession(impersonate="chrome") as session:
+                    js_resp = await session.get(js_url, headers=headers, timeout=15)
+                    js_text = js_resp.text
+
+                key_byte_indices = []
+                for item in INDICES_REGEX.finditer(js_text):
+                    key_byte_indices.append(int(item.group(1)))
+
+                if not key_byte_indices:
+                    bt.logging.warning("Could not extract key byte indices")
+                    return None
+
+                ct.DEFAULT_ROW_INDEX = key_byte_indices[0]
+                ct.DEFAULT_KEY_BYTES_INDICES = key_byte_indices[1:]
+                ct.key = ct.get_key(response=home_page)
+                ct.key_bytes = ct.get_key_bytes(key=ct.key)
+                ct.animation_key = ct.get_animation_key(
+                    key_bytes=ct.key_bytes, response=home_page
+                )
+
+                TwikitTwitterScraper._transaction = ct
+                bt.logging.success("ClientTransaction initialized from cache")
+                return ct
+
+            except Exception:
+                bt.logging.warning(
+                    f"Failed to init ClientTransaction: {traceback.format_exc()}"
+                )
+                return None
+
+    def _build_headers(self, cookies: dict, method: str = "GET",
+                       path: str = "") -> dict:
         """Build request headers matching browser format."""
-        return {
+        headers = {
             "accept": "*/*",
             "accept-language": "en-US,en;q=0.9",
             "authorization": f"Bearer {BEARER_TOKEN}",
@@ -140,13 +230,28 @@ class TwikitTwitterScraper(Scraper):
             "x-twitter-client-language": "en",
         }
 
+        # Add transaction ID if available
+        ct = TwikitTwitterScraper._transaction
+        if ct is not None:
+            try:
+                tid = ct.generate_transaction_id(method=method, path=path)
+                headers["x-client-transaction-id"] = tid
+            except Exception:
+                pass
+
+        return headers
+
     async def _graphql_request(self, query_id: str, operation: str,
                                 variables: dict, extra_params: dict = None) -> dict:
         """Make a GraphQL request to Twitter API using curl_cffi."""
         from curl_cffi.requests import AsyncSession
 
+        # Ensure transaction is initialized
+        await self._get_transaction()
+
         cookies = self._load_cookies()
-        headers = self._build_headers(cookies)
+        api_path = f"/i/api/graphql/{query_id}/{operation}"
+        headers = self._build_headers(cookies, method="GET", path=api_path)
 
         params = {
             "variables": json.dumps(variables, separators=(",", ":")),
@@ -156,7 +261,7 @@ class TwikitTwitterScraper(Scraper):
             for k, v in extra_params.items():
                 params[k] = json.dumps(v, separators=(",", ":")) if isinstance(v, dict) else v
 
-        base_url = f"https://x.com/i/api/graphql/{query_id}/{operation}"
+        base_url = f"https://x.com{api_path}"
 
         async with AsyncSession(impersonate="chrome") as session:
             response = await session.get(
@@ -169,9 +274,9 @@ class TwikitTwitterScraper(Scraper):
 
             bt.logging.debug(
                 f"GraphQL {operation}: status={response.status_code}, "
-                f"url={response.url}, "
-                f"resp_headers={dict(list(response.headers.items())[:5])}, "
-                f"body_preview={response.text[:300]}"
+                f"tid={'yes' if 'x-client-transaction-id' in headers else 'NO'}, "
+                f"body_len={len(response.text)}, "
+                f"body_preview={response.text[:200]}"
             )
 
             if response.status_code == 200:
