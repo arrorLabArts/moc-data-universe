@@ -51,7 +51,7 @@ class TwikitTwitterScraper(Scraper):
 
     SCRAPE_TIMEOUT_SECS = 120
     concurrent_validates_semaphore = threading.BoundedSemaphore(5)
-    MAX_RETRIES = 3
+    MAX_RETRIES = 1
 
     # Shared state across all instances
     _browser = None
