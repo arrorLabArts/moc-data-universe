@@ -440,6 +440,16 @@ class Miner:
 
     async def scrape_on_demand_job(self, job_request: OnDemandJob):
         try:
+            # Skip jobs that have already expired before we even start scraping
+            if (
+                job_request.expire_at
+                and dt.datetime.now(dt.timezone.utc) >= job_request.expire_at
+            ):
+                bt.logging.warning(
+                    f"Job {job_request.id}: already expired before scraping, skipping"
+                )
+                return
+
             bt.logging.info(
                 f"Starting on demand scrape for job with id {job_request.id}:\n\n {job_request}"
             )
@@ -501,6 +511,17 @@ class Miner:
             if not data:
                 bt.logging.info(
                     f"Job {job_request.id}: scraper returned no data, skipping submission"
+                )
+                return
+
+            # Check if job has already expired before wasting time uploading
+            if (
+                job_request.expire_at
+                and dt.datetime.now(dt.timezone.utc) >= job_request.expire_at
+            ):
+                bt.logging.warning(
+                    f"Job {job_request.id}: upload window already expired, "
+                    f"skipping submission"
                 )
                 return
 
