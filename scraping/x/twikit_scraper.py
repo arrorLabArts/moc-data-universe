@@ -156,14 +156,22 @@ class TwikitTwitterScraper(Scraper):
             for k, v in extra_params.items():
                 params[k] = json.dumps(v, separators=(",", ":")) if isinstance(v, dict) else v
 
-        url = f"https://x.com/i/api/graphql/{query_id}/{operation}?{urlencode(params, quote_via=quote)}"
+        base_url = f"https://x.com/i/api/graphql/{query_id}/{operation}"
 
         async with AsyncSession(impersonate="chrome") as session:
             response = await session.get(
-                url,
+                base_url,
+                params=params,
                 headers=headers,
                 cookies=cookies,
                 timeout=30,
+            )
+
+            bt.logging.debug(
+                f"GraphQL {operation}: status={response.status_code}, "
+                f"url={response.url}, "
+                f"resp_headers={dict(list(response.headers.items())[:5])}, "
+                f"body_preview={response.text[:300]}"
             )
 
             if response.status_code == 200:
@@ -173,7 +181,7 @@ class TwikitTwitterScraper(Scraper):
             else:
                 raise APIError(
                     f"Twitter API returned {response.status_code}: "
-                    f"{response.text[:200]}"
+                    f"{response.text[:500]}"
                 )
 
     async def _search_tweets(self, query: str, count: int = 20) -> list:
