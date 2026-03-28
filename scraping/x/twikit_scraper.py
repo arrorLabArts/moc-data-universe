@@ -241,7 +241,18 @@ class TwikitTwitterScraper(Scraper):
             bt.logging.warning("No SearchTimeline response captured")
             return []
 
-        return self._extract_tweets_from_timeline(data)
+        tweets = self._extract_tweets_from_timeline(data)
+        if not tweets:
+            # Debug: log response structure to diagnose parsing
+            try:
+                import json as _json
+                bt.logging.warning(
+                    f"SearchTimeline returned 0 tweets. "
+                    f"Response preview: {_json.dumps(data, default=str)[:500]}"
+                )
+            except Exception:
+                pass
+        return tweets
 
     async def _get_tweet_detail(self, tweet_id: str, tweet_url: str = None) -> Optional[dict]:
         """Get a single tweet by navigating to its page (serialized)."""
