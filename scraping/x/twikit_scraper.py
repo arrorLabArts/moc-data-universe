@@ -29,7 +29,8 @@ from scraping.x import utils
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 COOKIES_FILE = os.path.join(PROJECT_ROOT, "twikit_cookies.json")
 
-COOLDOWN_SECONDS = 10.0
+COOLDOWN_SECONDS = 3.0
+MAX_QUEUE_SIZE = 10  # ~7s per request, 10 * 7 = 70s < 120s job expiry
 
 
 class _QueueRequest:
@@ -203,15 +204,26 @@ class TwikitTwitterScraper(Scraper):
                 await asyncio.sleep(5)
 
     async def _enqueue(self, kind: str, **kwargs) -> Any:
-        """Submit a request to the queue and wait for the result."""
+        """Submit a request to the queue and wait for the result.
+        Returns None immediately if the queue is full."""
         await self._ensure_browser()
 
-        req = _QueueRequest(kind, **kwargs)
-        await TwikitTwitterScraper._queue.put(req)
+        queue = TwikitTwitterScraper._queue
+        if queue.qsize() >= MAX_QUEUE_SIZE:
+            bt.logging.warning(
+                f"X scraper queue full ({queue.qsize()}/{MAX_QUEUE_SIZE}), "
+                f"rejecting {kind} request"
+            )
+            return [] if kind == "search" else None
 
-        queue_size = TwikitTwitterScraper._queue.qsize()
+        req = _QueueRequest(kind, **kwargs)
+        await queue.put(req)
+
+        queue_size = queue.qsize()
         if queue_size > 1:
-            bt.logging.debug(f"Queued {kind} request (position: {queue_size})")
+            bt.logging.debug(
+                f"Queued {kind} request (position: {queue_size}/{MAX_QUEUE_SIZE})"
+            )
 
         return await req.future
 
