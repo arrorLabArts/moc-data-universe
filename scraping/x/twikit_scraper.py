@@ -837,10 +837,20 @@ class TwikitTwitterScraper(Scraper):
     ) -> List[DataEntity]:
         """On-demand scrape for validator requests."""
 
+        bt.logging.info(
+            f"On-demand X scrape request: url={url}, "
+            f"usernames={usernames}, keywords={keywords}, "
+            f"mode={keyword_mode}, start={start_datetime}, "
+            f"end={end_datetime}, limit={limit}"
+        )
+
         # Handle URL-based lookup
         if url:
             if not utils.is_valid_twitter_url(url):
-                bt.logging.error(f"Invalid Twitter URL: {url}")
+                bt.logging.warning(
+                    f"On-demand X scrape: invalid URL '{url}', "
+                    f"returning 0 items"
+                )
                 return []
 
             tweet_id = url.rstrip("/").split("/")[-1].split("?")[0]
@@ -849,10 +859,18 @@ class TwikitTwitterScraper(Scraper):
             try:
                 tweet_data = await self._get_tweet_with_retry(tweet_id)
                 if not tweet_data:
+                    bt.logging.warning(
+                        f"On-demand X scrape: tweet not found for "
+                        f"URL '{url}', returning 0 items"
+                    )
                     return []
 
                 x_content = self._parse_raw_tweet_to_xcontent(tweet_data)
                 if x_content is None:
+                    bt.logging.warning(
+                        f"On-demand X scrape: failed to parse tweet "
+                        f"from URL '{url}', returning 0 items"
+                    )
                     return []
 
                 return [XContent.to_data_entity(content=x_content)]
@@ -867,6 +885,10 @@ class TwikitTwitterScraper(Scraper):
             param is None
             for param in [usernames, keywords, start_datetime, end_datetime]
         ):
+            bt.logging.warning(
+                "On-demand X scrape: all params are None, "
+                "returning 0 items"
+            )
             return []
 
         bt.logging.info(
@@ -910,16 +932,25 @@ class TwikitTwitterScraper(Scraper):
         )
 
         data_entities = []
+        parse_failures = 0
         for tweet_data in raw_tweets[:limit]:
             x_content = self._parse_raw_tweet_to_xcontent(tweet_data)
             if x_content is None:
+                parse_failures += 1
                 continue
             data_entities.append(
                 XContent.to_data_entity(content=x_content)
             )
 
+        if parse_failures > 0:
+            bt.logging.warning(
+                f"On-demand X scrape: {parse_failures}/{len(raw_tweets)} "
+                f"tweets failed to parse for query: {query}"
+            )
+
         bt.logging.success(
             f"On-demand X scrape completed. "
-            f"Found {len(data_entities)} items."
+            f"Found {len(data_entities)} items "
+            f"(from {len(raw_tweets)} raw tweets)."
         )
         return data_entities
