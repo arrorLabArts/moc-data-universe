@@ -513,7 +513,7 @@ class TwikitTwitterScraper(Scraper):
                 bt.logging.debug(
                     f"Skipping tweet: tweet_id='{tweet_id}', "
                     f"screen_name='{screen_name}', "
-                    f"keys={list(tweet_data.keys())[:10]}"
+                    f"core={json.dumps(core, default=str)[:300]}"
                 )
                 return None
 
