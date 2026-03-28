@@ -41,16 +41,16 @@ class TwikitTwitterScraper(Scraper):
     _browser = None
     _context = None
     _browser_lock = None
-    _rate_lock = None
+    _request_semaphore = None  # Only 1 page open at a time
     _last_request_time = 0
-    MIN_REQUEST_INTERVAL = 4.0
+    MIN_REQUEST_INTERVAL = 5.0
     MAX_RETRIES = 3
 
     def __init__(self):
         if TwikitTwitterScraper._browser_lock is None:
             TwikitTwitterScraper._browser_lock = asyncio.Lock()
-        if TwikitTwitterScraper._rate_lock is None:
-            TwikitTwitterScraper._rate_lock = asyncio.Lock()
+        if TwikitTwitterScraper._request_semaphore is None:
+            TwikitTwitterScraper._request_semaphore = asyncio.Semaphore(1)
 
     @staticmethod
     def _load_cookies_raw() -> dict:
@@ -132,14 +132,13 @@ class TwikitTwitterScraper(Scraper):
             bt.logging.success("Playwright browser launched and cookies loaded")
             return context
 
-    async def _rate_limit(self):
-        """Simple rate limiter."""
-        async with TwikitTwitterScraper._rate_lock:
-            now = time.time()
-            elapsed = now - TwikitTwitterScraper._last_request_time
-            if elapsed < self.MIN_REQUEST_INTERVAL:
-                await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
-            TwikitTwitterScraper._last_request_time = time.time()
+    async def _rate_limit_wait(self):
+        """Wait for rate limit interval (call while holding semaphore)."""
+        now = time.time()
+        elapsed = now - TwikitTwitterScraper._last_request_time
+        if elapsed < self.MIN_REQUEST_INTERVAL:
+            await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
+        TwikitTwitterScraper._last_request_time = time.time()
 
     async def _intercept_api_response(
         self, url: str, api_pattern: str, timeout_ms: int = 30000
@@ -165,11 +164,15 @@ class TwikitTwitterScraper(Scraper):
                         bt.logging.debug(
                             f"Captured {api_pattern} response (200)"
                         )
+                    elif response.status == 429:
+                        bt.logging.warning(
+                            f"Rate limited (429) for {api_pattern}"
+                        )
+                        capture_event.set()
                     else:
                         bt.logging.warning(
                             f"API response {response.status} for {api_pattern}"
                         )
-                        # On non-200, also set event so we don't wait forever
                         capture_event.set()
                 except Exception as e:
                     bt.logging.warning(f"Error reading API response: {e}")
@@ -220,17 +223,19 @@ class TwikitTwitterScraper(Scraper):
             await page.close()
 
     async def _search_tweets(self, query: str, count: int = 20) -> list:
-        """Search tweets by navigating to the search page."""
+        """Search tweets by navigating to the search page (serialized)."""
         from urllib.parse import quote
 
         search_url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
 
-        await self._rate_limit()
+        # Only one Twitter request at a time across all instances
+        async with TwikitTwitterScraper._request_semaphore:
+            await self._rate_limit_wait()
 
-        bt.logging.debug(f"Playwright search: {query}")
-        data = await self._intercept_api_response(
-            search_url, "SearchTimeline", timeout_ms=45000
-        )
+            bt.logging.debug(f"Playwright search: {query}")
+            data = await self._intercept_api_response(
+                search_url, "SearchTimeline", timeout_ms=45000
+            )
 
         if not data:
             bt.logging.warning("No SearchTimeline response captured")
@@ -239,16 +244,18 @@ class TwikitTwitterScraper(Scraper):
         return self._extract_tweets_from_timeline(data)
 
     async def _get_tweet_detail(self, tweet_id: str, tweet_url: str = None) -> Optional[dict]:
-        """Get a single tweet by navigating to its page."""
+        """Get a single tweet by navigating to its page (serialized)."""
         if not tweet_url:
             tweet_url = f"https://x.com/i/status/{tweet_id}"
 
-        await self._rate_limit()
+        # Only one Twitter request at a time across all instances
+        async with TwikitTwitterScraper._request_semaphore:
+            await self._rate_limit_wait()
 
-        bt.logging.debug(f"Playwright tweet detail: {tweet_id}")
-        data = await self._intercept_api_response(
-            tweet_url, "TweetDetail", timeout_ms=30000
-        )
+            bt.logging.debug(f"Playwright tweet detail: {tweet_id}")
+            data = await self._intercept_api_response(
+                tweet_url, "TweetDetail", timeout_ms=30000
+            )
 
         if not data:
             bt.logging.warning(f"No TweetDetail response captured for {tweet_id}")
