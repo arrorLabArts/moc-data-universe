@@ -1,17 +1,20 @@
 """
-Custom X/Twitter scraper using twikit library.
-Uses Twitter's internal GraphQL API with cookie-based auth.
-Requires X_USERNAME, X_EMAIL, and X_PASSWORD in .env file.
+Custom X/Twitter scraper using curl_cffi for Cloudflare bypass.
+Calls Twitter's GraphQL API directly with browser-like TLS fingerprint.
+Requires browser cookies in twikit_cookies.json (auth_token, ct0, etc).
 """
 
 import asyncio
+import json
 import os
+import time
 import traceback
 import threading
 import datetime as dt
 import bittensor as bt
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlencode, quote
 
 from common.data import DataEntity, DataLabel, DataSource
 from common.protocol import KeywordMode
@@ -20,173 +23,267 @@ from scraping.x.model import XContent
 from scraping.x import utils
 
 
-# Cookie file location (persists login across restarts)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 COOKIES_FILE = os.path.join(PROJECT_ROOT, "twikit_cookies.json")
-HOMEPAGE_CACHE_FILE = os.path.join(PROJECT_ROOT, "twikit_homepage.html")
+
+BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+
+# Current GraphQL query IDs - update these when Twitter rotates them
+SEARCH_TIMELINE_ID = "GcXk9vN_d1jUfHNqLacXQA"
+TWEET_DETAIL_ID = "CysGzLIZa76UzZ3WTe-Bhg"
+
+GRAPHQL_FEATURES = {
+    "rweb_video_screen_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": False,
+    "rweb_tipjar_consumption_enabled": False,
+    "verified_phone_label_enabled": True,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": True,
+    "responsive_web_jetfuel_frame": True,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "responsive_web_grok_annotations_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "content_disclosure_indicator_enabled": True,
+    "content_disclosure_ai_generated_indicator_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": False,
+    "responsive_web_grok_analysis_button_from_backend": True,
+    "post_ctas_fetch_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": False,
+    "responsive_web_grok_image_annotation_enabled": True,
+    "responsive_web_grok_imagine_annotation_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
+    "responsive_web_enhance_cards_enabled": False,
+}
+
+FIELD_TOGGLES = {
+    "withArticleRichContentState": True,
+    "withArticlePlainText": False,
+    "withArticleSummaryText": True,
+    "withArticleVoiceOver": True,
+    "withGrokAnalyze": False,
+    "withDisallowedReplyControls": False,
+}
 
 
 class TwikitTwitterScraper(Scraper):
     """
-    Scrapes tweets using twikit (Twitter's internal GraphQL API).
-    Free alternative to Apify - only requires a regular X/Twitter account.
+    Scrapes tweets using Twitter's GraphQL API directly via curl_cffi.
+    Bypasses Cloudflare by impersonating browser TLS fingerprint.
     """
 
     SCRAPE_TIMEOUT_SECS = 120
     concurrent_validates_semaphore = threading.BoundedSemaphore(5)
 
-    # Shared client across all instances (singleton pattern)
-    _shared_client = None
-    _shared_login_lock = None
-    _shared_logged_in = False
-    _shared_rate_lock = None
+    # Shared state across all instances
+    _cookies = None
+    _rate_lock = None
     _last_request_time = 0
-    MIN_REQUEST_INTERVAL = 5.0  # seconds between API calls
+    MIN_REQUEST_INTERVAL = 3.0
     MAX_RETRIES = 3
 
     def __init__(self):
-        # Initialize class-level locks once
-        if TwikitTwitterScraper._shared_login_lock is None:
-            TwikitTwitterScraper._shared_login_lock = asyncio.Lock()
-        if TwikitTwitterScraper._shared_rate_lock is None:
-            TwikitTwitterScraper._shared_rate_lock = asyncio.Lock()
+        if TwikitTwitterScraper._rate_lock is None:
+            TwikitTwitterScraper._rate_lock = asyncio.Lock()
+
+    def _load_cookies(self):
+        """Load cookies from file (cached across instances)."""
+        if TwikitTwitterScraper._cookies is not None:
+            return TwikitTwitterScraper._cookies
+
+        if not os.path.exists(COOKIES_FILE):
+            raise FileNotFoundError(
+                f"Cookie file not found: {COOKIES_FILE}. "
+                "Export cookies from your browser."
+            )
+
+        with open(COOKIES_FILE, "r") as f:
+            TwikitTwitterScraper._cookies = json.load(f)
+
+        bt.logging.success("Loaded X cookies from file")
+        return TwikitTwitterScraper._cookies
 
     async def _rate_limit(self):
-        """Simple rate limiter to avoid 429 errors."""
-        async with TwikitTwitterScraper._shared_rate_lock:
-            import time
+        """Simple rate limiter."""
+        async with TwikitTwitterScraper._rate_lock:
             now = time.time()
             elapsed = now - TwikitTwitterScraper._last_request_time
             if elapsed < self.MIN_REQUEST_INTERVAL:
                 await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
             TwikitTwitterScraper._last_request_time = time.time()
 
-    async def _search_with_retry(self, client, query, count):
-        """Search tweets with retry on rate limit."""
-        from twikit.errors import TooManyRequests
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                await self._rate_limit()
-                return await client.search_tweet(
-                    query, product="Latest", count=count
-                )
-            except TooManyRequests:
-                wait = 15 * (attempt + 1)  # 15s, 30s, 45s
-                bt.logging.warning(
-                    f"Rate limited on attempt {attempt + 1}, "
-                    f"waiting {wait}s before retry"
-                )
-                await asyncio.sleep(wait)
-        bt.logging.error(f"Failed after {self.MAX_RETRIES} retries for: {query}")
-        return None
-
-    async def _get_tweet_with_retry(self, client, tweet_id):
-        """Get tweet by ID with retry on rate limit."""
-        from twikit.errors import TooManyRequests
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                await self._rate_limit()
-                return await client.get_tweet_by_id(tweet_id)
-            except TooManyRequests:
-                wait = 15 * (attempt + 1)
-                bt.logging.warning(
-                    f"Rate limited fetching tweet {tweet_id}, "
-                    f"waiting {wait}s"
-                )
-                await asyncio.sleep(wait)
-        return None
-
-    async def _get_client(self):
-        """Get or create an authenticated twikit client (shared singleton)."""
-        if TwikitTwitterScraper._shared_client is not None and TwikitTwitterScraper._shared_logged_in:
-            return TwikitTwitterScraper._shared_client
-
-        async with TwikitTwitterScraper._shared_login_lock:
-            # Double-check after acquiring lock
-            if TwikitTwitterScraper._shared_client is not None and TwikitTwitterScraper._shared_logged_in:
-                return TwikitTwitterScraper._shared_client
-
-            from twikit import Client
-
-            client = Client("en-US")
-
-            # Try loading saved cookies first
-            if os.path.exists(COOKIES_FILE):
-                try:
-                    client.load_cookies(COOKIES_FILE)
-                    bt.logging.success("Loaded twikit cookies from file")
-
-                    # Pre-init ClientTransaction from cached homepage
-                    # to avoid Cloudflare blocks on server
-                    if os.path.exists(HOMEPAGE_CACHE_FILE):
-                        try:
-                            await self._init_transaction_from_cache(client)
-                            bt.logging.success(
-                                "Loaded cached homepage for ClientTransaction"
-                            )
-                        except Exception:
-                            bt.logging.warning(
-                                f"Failed to init from cached homepage: "
-                                f"{traceback.format_exc()}"
-                            )
-
-                    TwikitTwitterScraper._shared_client = client
-                    TwikitTwitterScraper._shared_logged_in = True
-                    return client
-                except Exception:
-                    bt.logging.warning(
-                        "Failed to load cookies, will re-login"
-                    )
-
-            # Login with credentials
-            username = os.getenv("X_USERNAME")
-            email = os.getenv("X_EMAIL")
-            password = os.getenv("X_PASSWORD")
-
-            if not all([username, email, password]):
-                raise ValueError(
-                    "X_USERNAME, X_EMAIL, and X_PASSWORD must be set in .env "
-                    "for the twikit scraper"
-                )
-
-            await client.login(
-                auth_info_1=username,
-                auth_info_2=email,
-                password=password,
-            )
-            client.save_cookies(COOKIES_FILE)
-            TwikitTwitterScraper._shared_client = client
-            TwikitTwitterScraper._shared_logged_in = True
-            bt.logging.success(f"Logged into X as @{username}")
-
-            return client
-
-    async def _init_transaction_from_cache(self, client):
-        """Initialize ClientTransaction using cached homepage HTML."""
-        import bs4
-
-        with open(HOMEPAGE_CACHE_FILE, "r", encoding="utf-8") as f:
-            html = f.read()
-
-        home_page = bs4.BeautifulSoup(html, "lxml")
-        ct = client.client_transaction
-        ct.home_page_response = home_page
-
-        headers = {
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Referer": "https://x.com",
-            "User-Agent": client._user_agent,
+    def _build_headers(self, cookies: dict) -> dict:
+        """Build request headers matching browser format."""
+        return {
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "authorization": f"Bearer {BEARER_TOKEN}",
+            "content-type": "application/json",
+            "x-csrf-token": cookies.get("ct0", ""),
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
         }
 
-        ct.DEFAULT_ROW_INDEX, ct.DEFAULT_KEY_BYTES_INDICES = (
-            await ct.get_indices(home_page, client.http, headers)
+    async def _graphql_request(self, query_id: str, operation: str,
+                                variables: dict, extra_params: dict = None) -> dict:
+        """Make a GraphQL request to Twitter API using curl_cffi."""
+        from curl_cffi.requests import AsyncSession
+
+        cookies = self._load_cookies()
+        headers = self._build_headers(cookies)
+
+        params = {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": json.dumps(GRAPHQL_FEATURES, separators=(",", ":")),
+        }
+        if extra_params:
+            for k, v in extra_params.items():
+                params[k] = json.dumps(v, separators=(",", ":")) if isinstance(v, dict) else v
+
+        url = f"https://x.com/i/api/graphql/{query_id}/{operation}?{urlencode(params, quote_via=quote)}"
+
+        async with AsyncSession(impersonate="chrome") as session:
+            response = await session.get(
+                url,
+                headers=headers,
+                cookies=cookies,
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                raise RateLimitError(f"Rate limited (429)")
+            else:
+                raise APIError(
+                    f"Twitter API returned {response.status_code}: "
+                    f"{response.text[:200]}"
+                )
+
+    async def _search_tweets(self, query: str, count: int = 20) -> list:
+        """Search tweets and return raw tweet data list."""
+        variables = {
+            "rawQuery": query,
+            "count": count,
+            "querySource": "typed_query",
+            "product": "Latest",
+        }
+
+        await self._rate_limit()
+        data = await self._graphql_request(
+            SEARCH_TIMELINE_ID, "SearchTimeline", variables
         )
-        ct.key = ct.get_key(response=home_page)
-        ct.key_bytes = ct.get_key_bytes(key=ct.key)
-        ct.animation_key = ct.get_animation_key(
-            key_bytes=ct.key_bytes, response=home_page
+
+        return self._extract_tweets_from_timeline(data)
+
+    async def _get_tweet_detail(self, tweet_id: str) -> Optional[dict]:
+        """Get a single tweet by ID."""
+        variables = {
+            "focalTweetId": tweet_id,
+            "with_rux_injections": False,
+            "rankingMode": "Relevance",
+            "includePromotedContent": True,
+            "withCommunity": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withBirdwatchNotes": True,
+            "withVoice": True,
+        }
+
+        await self._rate_limit()
+        data = await self._graphql_request(
+            TWEET_DETAIL_ID, "TweetDetail", variables,
+            extra_params={"fieldToggles": FIELD_TOGGLES}
         )
+
+        tweets = self._extract_tweets_from_detail(data)
+        # Find the focal tweet
+        for t in tweets:
+            if t.get("rest_id") == tweet_id:
+                return t
+        return tweets[0] if tweets else None
+
+    def _extract_tweets_from_timeline(self, data: dict) -> list:
+        """Extract tweet data from SearchTimeline response."""
+        tweets = []
+        try:
+            instructions = data.get("data", {}).get("search_by_raw_query", {}).get("search_timeline", {}).get("timeline", {}).get("instructions", [])
+            for instruction in instructions:
+                entries = instruction.get("entries", [])
+                for entry in entries:
+                    content = entry.get("content", {})
+                    item_content = content.get("itemContent", {})
+                    if not item_content:
+                        # Check for items in moduleItems
+                        items = content.get("items", [])
+                        for item in items:
+                            ic = item.get("item", {}).get("itemContent", {})
+                            tweet_results = ic.get("tweet_results", {})
+                            result = tweet_results.get("result", {})
+                            if result:
+                                tweets.append(self._normalize_tweet_result(result))
+                        continue
+
+                    tweet_results = item_content.get("tweet_results", {})
+                    result = tweet_results.get("result", {})
+                    if result:
+                        tweets.append(self._normalize_tweet_result(result))
+        except Exception:
+            bt.logging.warning(f"Failed to extract tweets: {traceback.format_exc()}")
+        return [t for t in tweets if t is not None]
+
+    def _extract_tweets_from_detail(self, data: dict) -> list:
+        """Extract tweet data from TweetDetail response."""
+        tweets = []
+        try:
+            instructions = data.get("data", {}).get("threaded_conversation_with_injections_v2", {}).get("instructions", [])
+            for instruction in instructions:
+                entries = instruction.get("entries", [])
+                for entry in entries:
+                    content = entry.get("content", {})
+                    item_content = content.get("itemContent", {})
+                    if item_content:
+                        tweet_results = item_content.get("tweet_results", {})
+                        result = tweet_results.get("result", {})
+                        if result:
+                            tweets.append(self._normalize_tweet_result(result))
+                    # Also check items for threaded replies
+                    items = content.get("items", [])
+                    for item in items:
+                        ic = item.get("item", {}).get("itemContent", {})
+                        tweet_results = ic.get("tweet_results", {})
+                        result = tweet_results.get("result", {})
+                        if result:
+                            tweets.append(self._normalize_tweet_result(result))
+        except Exception:
+            bt.logging.warning(f"Failed to extract tweet detail: {traceback.format_exc()}")
+        return [t for t in tweets if t is not None]
+
+    def _normalize_tweet_result(self, result: dict) -> Optional[dict]:
+        """Normalize a tweet result object, handling various wrapper types."""
+        # Handle TweetWithVisibilityResults wrapper
+        if result.get("__typename") == "TweetWithVisibilityResults":
+            result = result.get("tweet", {})
+        if result.get("__typename") == "TweetTombstone":
+            return None
+        if not result.get("legacy"):
+            return result if result.get("rest_id") else None
+        return result
 
     @staticmethod
     def _safe_int(val) -> Optional[int]:
@@ -197,93 +294,135 @@ class TwikitTwitterScraper(Scraper):
         except (ValueError, TypeError):
             return None
 
-    def _parse_tweet_to_xcontent(self, tweet) -> Optional[XContent]:
-        """Convert a twikit Tweet object to XContent."""
+    def _parse_raw_tweet_to_xcontent(self, tweet_data: dict) -> Optional[XContent]:
+        """Convert raw GraphQL tweet data to XContent."""
         try:
-            # Build URL
-            url = f"https://x.com/{tweet.user.screen_name}/status/{tweet.id}"
+            legacy = tweet_data.get("legacy", {})
+            core = tweet_data.get("core", {})
+            user_results = core.get("user_results", {}).get("result", {})
+            user_legacy = user_results.get("legacy", {})
 
-            # Extract hashtags in order
+            tweet_id = tweet_data.get("rest_id", "")
+            screen_name = user_legacy.get("screen_name", "")
+
+            if not tweet_id or not screen_name:
+                return None
+
+            url = f"https://x.com/{screen_name}/status/{tweet_id}"
+
+            # Text
+            text = legacy.get("full_text", "")
+
+            # Hashtags
             hashtags = []
-            if tweet.hashtags:
-                hashtags = [f"#{tag}" for tag in tweet.hashtags]
+            entities = legacy.get("entities", {})
+            for ht in entities.get("hashtags", []):
+                hashtags.append(f"#{ht.get('text', '')}")
 
-            # Extract media URLs
+            # Media
             media_urls = None
-            if tweet.media:
-                media_urls = []
-                for m in tweet.media:
-                    media_url = getattr(m, "media_url", None)
-                    if media_url:
-                        media_urls.append(media_url)
+            extended = legacy.get("extended_entities", {})
+            media_list = extended.get("media", entities.get("media", []))
+            if media_list:
+                media_urls = [m.get("media_url_https") or m.get("media_url") for m in media_list if m.get("media_url_https") or m.get("media_url")]
                 if not media_urls:
                     media_urls = None
 
-            # Parse timestamp
-            timestamp = dt.datetime.strptime(
-                tweet.created_at, "%a %b %d %H:%M:%S %z %Y"
-            )
+            # Timestamp
+            created_at = legacy.get("created_at", "")
+            timestamp = dt.datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
 
-            # Determine tweet type
-            reply_to_status = tweet.in_reply_to  # status ID string or None
-            is_reply = reply_to_status is not None
-            is_quote = getattr(tweet, "is_quote_status", None)
+            # Reply/quote info
+            in_reply_to_status = legacy.get("in_reply_to_status_id_str")
+            is_reply = in_reply_to_status is not None
+            is_quote = legacy.get("is_quote_status", False)
 
-            # Extract user data
-            user = tweet.user
+            # Quoted tweet
+            quoted_tweet_id = None
+            quoted = tweet_data.get("quoted_status_result", {}).get("result", {})
+            if quoted:
+                quoted_tweet_id = quoted.get("rest_id")
 
-            # Extract in_reply_to user ID from legacy data
-            in_reply_to_user_id = tweet._legacy.get("in_reply_to_user_id_str")
-            in_reply_to_screen_name = tweet._legacy.get("in_reply_to_screen_name")
+            # View count
+            views = tweet_data.get("views", {})
+            view_count = self._safe_int(views.get("count"))
 
             return XContent(
-                username=user.screen_name,
-                text=utils.sanitize_scraped_tweet(tweet.full_text or tweet.text or ""),
+                username=screen_name,
+                text=utils.sanitize_scraped_tweet(text),
                 url=url,
                 timestamp=timestamp,
                 tweet_hashtags=hashtags,
                 media=media_urls,
                 # User fields
-                user_id=str(user.id) if user.id else None,
-                user_display_name=user.name,
-                user_verified=getattr(user, "verified", None),
+                user_id=user_results.get("rest_id"),
+                user_display_name=user_legacy.get("name"),
+                user_verified=user_legacy.get("verified"),
                 # Tweet metadata
-                tweet_id=str(tweet.id),
+                tweet_id=tweet_id,
                 is_reply=is_reply,
                 is_quote=is_quote,
-                conversation_id=tweet._data.get("conversation_id_str"),
-                in_reply_to_user_id=in_reply_to_user_id,
-                # Static metadata
-                language=tweet._legacy.get("lang"),
-                in_reply_to_username=in_reply_to_screen_name,
-                quoted_tweet_id=(
-                    str(tweet.quote.id)
-                    if tweet.quote
-                    else None
-                ),
-                # Engagement metrics
-                like_count=getattr(tweet, "favorite_count", None),
-                retweet_count=getattr(tweet, "retweet_count", None),
-                reply_count=getattr(tweet, "reply_count", None),
-                quote_count=getattr(tweet, "quote_count", None),
-                view_count=self._safe_int(getattr(tweet, "view_count", None)),
-                bookmark_count=getattr(tweet, "bookmark_count", None),
-                # User profile data
-                user_blue_verified=getattr(user, "is_blue_verified", None),
-                user_description=getattr(user, "description", None) or None,
-                user_location=getattr(user, "location", None) or None,
-                profile_image_url=getattr(user, "profile_image_url", None) or None,
-                cover_picture_url=getattr(user, "profile_banner_url", None) or None,
-                user_followers_count=getattr(user, "followers_count", None),
-                user_following_count=getattr(user, "following_count", None),
-                # Scrape tracking
+                conversation_id=legacy.get("conversation_id_str"),
+                in_reply_to_user_id=legacy.get("in_reply_to_user_id_str"),
+                language=legacy.get("lang"),
+                in_reply_to_username=legacy.get("in_reply_to_screen_name"),
+                quoted_tweet_id=quoted_tweet_id,
+                # Engagement
+                like_count=legacy.get("favorite_count"),
+                retweet_count=legacy.get("retweet_count"),
+                reply_count=legacy.get("reply_count"),
+                quote_count=legacy.get("quote_count"),
+                view_count=view_count,
+                bookmark_count=legacy.get("bookmark_count"),
+                # User profile
+                user_blue_verified=user_results.get("is_blue_verified"),
+                user_description=user_legacy.get("description") or None,
+                user_location=user_legacy.get("location") or None,
+                profile_image_url=user_legacy.get("profile_image_url_https") or None,
+                cover_picture_url=user_legacy.get("profile_banner_url") or None,
+                user_followers_count=user_legacy.get("followers_count"),
+                user_following_count=user_legacy.get("friends_count"),
                 scraped_at=dt.datetime.now(dt.timezone.utc),
             )
         except Exception:
-            bt.logging.warning(
-                f"Failed to parse tweet: {traceback.format_exc()}"
-            )
+            bt.logging.warning(f"Failed to parse tweet: {traceback.format_exc()}")
             return None
+
+    async def _search_with_retry(self, query: str, count: int = 20) -> list:
+        """Search with retry on rate limit."""
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return await self._search_tweets(query, count)
+            except RateLimitError:
+                wait = 15 * (attempt + 1)
+                bt.logging.warning(
+                    f"Rate limited on attempt {attempt + 1}, waiting {wait}s"
+                )
+                await asyncio.sleep(wait)
+            except Exception:
+                bt.logging.error(
+                    f"Search failed: {traceback.format_exc()}"
+                )
+                return []
+        return []
+
+    async def _get_tweet_with_retry(self, tweet_id: str) -> Optional[dict]:
+        """Get tweet by ID with retry."""
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return await self._get_tweet_detail(tweet_id)
+            except RateLimitError:
+                wait = 15 * (attempt + 1)
+                bt.logging.warning(
+                    f"Rate limited fetching tweet {tweet_id}, waiting {wait}s"
+                )
+                await asyncio.sleep(wait)
+            except Exception:
+                bt.logging.error(
+                    f"Get tweet failed: {traceback.format_exc()}"
+                )
+                return None
+        return None
 
     async def validate(
         self, entities: List[DataEntity], allow_low_engagement: bool = False
@@ -299,20 +438,17 @@ class TwikitTwitterScraper(Scraper):
                 )
 
             try:
-                client = await self._get_client()
-
-                # Extract tweet ID from URL
                 tweet_id = entity.uri.rstrip("/").split("/")[-1].split("?")[0]
+                tweet_data = await self._get_tweet_with_retry(tweet_id)
 
-                tweet = await self._get_tweet_with_retry(client, tweet_id)
-                if not tweet:
+                if not tweet_data:
                     return ValidationResult(
                         is_valid=False,
-                        reason="Tweet not found or rate limited.",
+                        reason="Tweet not found.",
                         content_size_bytes_validated=entity.content_size_bytes,
                     )
 
-                actual_content = self._parse_tweet_to_xcontent(tweet)
+                actual_content = self._parse_raw_tweet_to_xcontent(tweet_data)
                 if not actual_content:
                     return ValidationResult(
                         is_valid=False,
@@ -320,15 +456,17 @@ class TwikitTwitterScraper(Scraper):
                         content_size_bytes_validated=entity.content_size_bytes,
                     )
 
-                # Build author_data dict for spam check
-                author_data = {
-                    "followers": getattr(tweet.user, "followers_count", 0),
-                    "createdAt": getattr(tweet.user, "created_at", None),
-                }
-                view_count = getattr(tweet, "view_count", 0) or 0
-                is_retweet = getattr(tweet, "is_retweet", False) or False
+                legacy = tweet_data.get("legacy", {})
+                user_legacy = tweet_data.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
 
-                # Check spam/engagement if filtering enabled
+                author_data = {
+                    "followers": user_legacy.get("followers_count", 0),
+                    "createdAt": user_legacy.get("created_at"),
+                }
+                views = tweet_data.get("views", {})
+                view_count = self._safe_int(views.get("count")) or 0
+                is_retweet = legacy.get("retweeted", False)
+
                 if not allow_low_engagement:
                     if utils.is_spam_account(author_data):
                         return ValidationResult(
@@ -375,14 +513,6 @@ class TwikitTwitterScraper(Scraper):
         self, scrape_config: ScrapeConfig, allow_low_engagement: bool = False
     ) -> List[DataEntity]:
         """Scrape tweets based on config."""
-        try:
-            client = await self._get_client()
-        except Exception:
-            bt.logging.error(
-                f"Failed to get twikit client: {traceback.format_exc()}"
-            )
-            return []
-
         # Build search query
         query_parts = []
 
@@ -403,7 +533,6 @@ class TwikitTwitterScraper(Scraper):
         else:
             query_parts.append("e")
 
-        # Add date range
         date_format = "%Y-%m-%d"
         query_parts.append(
             f"since:{scrape_config.date_range.start.strftime(date_format)}"
@@ -415,78 +544,31 @@ class TwikitTwitterScraper(Scraper):
         query = " ".join(query_parts)
         max_items = scrape_config.entity_limit or 150
 
-        bt.logging.success(f"Performing twikit scrape for: {query}")
+        bt.logging.success(f"Performing X scrape for: {query}")
 
-        search_result = await self._search_with_retry(
-            client, query, min(max_items, 20)
-        )
-        if search_result is None:
-            return []
+        raw_tweets = await self._search_with_retry(query, min(max_items, 20))
 
         data_entities = []
-        tweets_processed = 0
-
-        # Process first page
-        for tweet in search_result:
-            if tweets_processed >= max_items:
-                break
-
-            x_content = self._parse_tweet_to_xcontent(tweet)
+        for tweet_data in raw_tweets[:max_items]:
+            x_content = self._parse_raw_tweet_to_xcontent(tweet_data)
             if x_content is None:
                 continue
 
             if not allow_low_engagement:
-                author_data = {
-                    "followers": getattr(tweet.user, "followers_count", 0),
-                }
+                user_legacy = tweet_data.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
+                author_data = {"followers": user_legacy.get("followers_count", 0)}
                 if utils.is_spam_account(author_data):
                     continue
-                if utils.is_low_engagement_tweet(
-                    {"viewCount": getattr(tweet, "view_count", 0) or 0}
-                ):
+                views = tweet_data.get("views", {})
+                view_count = self._safe_int(views.get("count")) or 0
+                if utils.is_low_engagement_tweet({"viewCount": view_count}):
                     continue
 
             data_entities.append(XContent.to_data_entity(content=x_content))
-            tweets_processed += 1
-
-        # Fetch more pages if needed
-        while tweets_processed < max_items:
-            try:
-                more_tweets = await search_result.next()
-                if not more_tweets:
-                    break
-            except Exception:
-                break
-
-            for tweet in more_tweets:
-                if tweets_processed >= max_items:
-                    break
-
-                x_content = self._parse_tweet_to_xcontent(tweet)
-                if x_content is None:
-                    continue
-
-                if not allow_low_engagement:
-                    author_data = {
-                        "followers": getattr(tweet.user, "followers_count", 0),
-                    }
-                    if utils.is_spam_account(author_data):
-                        continue
-                    if utils.is_low_engagement_tweet(
-                        {"viewCount": getattr(tweet, "view_count", 0) or 0}
-                    ):
-                        continue
-
-                data_entities.append(XContent.to_data_entity(content=x_content))
-                tweets_processed += 1
-
-            # Small delay to avoid rate limiting
-            await asyncio.sleep(1)
 
         bt.logging.success(
-            f"Completed twikit scrape for {query}. Scraped {len(data_entities)} items."
+            f"Completed X scrape for {query}. Scraped {len(data_entities)} items."
         )
-
         return data_entities
 
     async def on_demand_scrape(
@@ -500,13 +582,6 @@ class TwikitTwitterScraper(Scraper):
         limit: int = 100,
     ) -> List[DataEntity]:
         """On-demand scrape for validator requests."""
-        try:
-            client = await self._get_client()
-        except Exception:
-            bt.logging.error(
-                f"Failed to get twikit client: {traceback.format_exc()}"
-            )
-            return []
 
         # Handle URL-based lookup
         if url:
@@ -515,14 +590,14 @@ class TwikitTwitterScraper(Scraper):
                 return []
 
             tweet_id = url.rstrip("/").split("/")[-1].split("?")[0]
-            bt.logging.info(f"On-demand twikit scrape for URL: {url}")
+            bt.logging.info(f"On-demand X scrape for URL: {url}")
 
             try:
-                tweet = await self._get_tweet_with_retry(client, tweet_id)
-                if not tweet:
+                tweet_data = await self._get_tweet_with_retry(tweet_id)
+                if not tweet_data:
                     return []
 
-                x_content = self._parse_tweet_to_xcontent(tweet)
+                x_content = self._parse_raw_tweet_to_xcontent(tweet_data)
                 if x_content is None:
                     return []
 
@@ -531,8 +606,6 @@ class TwikitTwitterScraper(Scraper):
                 bt.logging.error(
                     f"Failed to fetch tweet {url}: {traceback.format_exc()}"
                 )
-                self._logged_in = False
-                self._client = None
                 return []
 
         # Return empty if no params
@@ -543,7 +616,7 @@ class TwikitTwitterScraper(Scraper):
             return []
 
         bt.logging.info(
-            f"On-demand twikit scrape: usernames={usernames}, "
+            f"On-demand X scrape: usernames={usernames}, "
             f"keywords={keywords}, mode={keyword_mode}"
         )
 
@@ -573,52 +646,26 @@ class TwikitTwitterScraper(Scraper):
 
         query = " ".join(query_parts)
 
-        bt.logging.success(f"On-demand twikit scrape for: {query}")
+        bt.logging.success(f"On-demand X scrape for: {query}")
 
-        search_result = await self._search_with_retry(
-            client, query, min(limit, 20)
-        )
-        if search_result is None:
-            return []
+        raw_tweets = await self._search_with_retry(query, min(limit, 20))
 
         data_entities = []
-        tweets_processed = 0
-
-        for tweet in search_result:
-            if tweets_processed >= limit:
-                break
-
-            x_content = self._parse_tweet_to_xcontent(tweet)
+        for tweet_data in raw_tweets[:limit]:
+            x_content = self._parse_raw_tweet_to_xcontent(tweet_data)
             if x_content is None:
                 continue
-
             data_entities.append(XContent.to_data_entity(content=x_content))
-            tweets_processed += 1
-
-        # Fetch more pages if needed
-        while tweets_processed < limit:
-            try:
-                more_tweets = await search_result.next()
-                if not more_tweets:
-                    break
-            except Exception:
-                break
-
-            for tweet in more_tweets:
-                if tweets_processed >= limit:
-                    break
-
-                x_content = self._parse_tweet_to_xcontent(tweet)
-                if x_content is None:
-                    continue
-
-                data_entities.append(XContent.to_data_entity(content=x_content))
-                tweets_processed += 1
-
-            await asyncio.sleep(1)
 
         bt.logging.success(
-            f"On-demand twikit scrape completed. Found {len(data_entities)} items."
+            f"On-demand X scrape completed. Found {len(data_entities)} items."
         )
-
         return data_entities
+
+
+class RateLimitError(Exception):
+    pass
+
+
+class APIError(Exception):
+    pass
