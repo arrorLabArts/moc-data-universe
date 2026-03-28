@@ -57,6 +57,7 @@ from common.date_range import DateRange
 from scraping.scraper import ScrapeConfig, ScraperId
 
 from scraping.x.apidojo_scraper import ApiDojoTwitterScraper
+from scraping.x.twikit_scraper import TwikitTwitterScraper
 from scraping.reddit.reddit_custom_scraper import RedditCustomScraper
 from scraping.reddit.reddit_json_scraper import RedditJsonScraper
 import json
@@ -718,10 +719,10 @@ class Miner:
 
             bt.logging.info(f"Date range: {start_dt} to {end_dt}")
 
-            # For X source, use the standard scraper with on_demand_scrape
+            # For X source, use twikit scraper (falls back to apidojo if twikit fails)
             if synapse.source == DataSource.X:
-                # Initialize the standard scraper (now includes low-engagement posts)
-                scraper = ApiDojoTwitterScraper()
+                # Use TwikitTwitterScraper (free, no Apify token needed)
+                scraper = TwikitTwitterScraper()
                 data_entities = await scraper.on_demand_scrape(
                     usernames=synapse.usernames,
                     keywords=synapse.keywords,
