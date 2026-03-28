@@ -21,9 +21,9 @@ from scraping.x import utils
 
 
 # Cookie file location (persists login across restarts)
-COOKIES_FILE = os.path.join(
-    Path(__file__).parent.parent.parent, "twikit_cookies.json"
-)
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+COOKIES_FILE = os.path.join(PROJECT_ROOT, "twikit_cookies.json")
+HOMEPAGE_CACHE_FILE = os.path.join(PROJECT_ROOT, "twikit_homepage.html")
 
 
 class TwikitTwitterScraper(Scraper):
@@ -60,6 +60,21 @@ class TwikitTwitterScraper(Scraper):
                     self._client.load_cookies(COOKIES_FILE)
                     self._logged_in = True
                     bt.logging.success("Loaded twikit cookies from file")
+
+                    # Pre-init ClientTransaction from cached homepage
+                    # to avoid Cloudflare blocks on server
+                    if os.path.exists(HOMEPAGE_CACHE_FILE):
+                        try:
+                            await self._init_transaction_from_cache()
+                            bt.logging.success(
+                                "Loaded cached homepage for ClientTransaction"
+                            )
+                        except Exception:
+                            bt.logging.warning(
+                                f"Failed to init from cached homepage: "
+                                f"{traceback.format_exc()}"
+                            )
+
                     return self._client
                 except Exception:
                     bt.logging.warning(
@@ -87,6 +102,33 @@ class TwikitTwitterScraper(Scraper):
             bt.logging.success(f"Logged into X as @{username}")
 
             return self._client
+
+    async def _init_transaction_from_cache(self):
+        """Initialize ClientTransaction using cached homepage HTML."""
+        import bs4
+
+        with open(HOMEPAGE_CACHE_FILE, "r", encoding="utf-8") as f:
+            html = f.read()
+
+        home_page = bs4.BeautifulSoup(html, "lxml")
+        ct = self._client.client_transaction
+        ct.home_page_response = home_page
+
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Referer": "https://x.com",
+            "User-Agent": self._client._user_agent,
+        }
+
+        ct.DEFAULT_ROW_INDEX, ct.DEFAULT_KEY_BYTES_INDICES = (
+            await ct.get_indices(home_page, self._client.http, headers)
+        )
+        ct.key = ct.get_key(response=home_page)
+        ct.key_bytes = ct.get_key_bytes(key=ct.key)
+        ct.animation_key = ct.get_animation_key(
+            key_bytes=ct.key_bytes, response=home_page
+        )
 
     @staticmethod
     def _safe_int(val) -> Optional[int]:
