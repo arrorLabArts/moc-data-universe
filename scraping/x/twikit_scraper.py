@@ -590,33 +590,39 @@ class TwikitTwitterScraper(Scraper):
                 timestamp=timestamp,
                 tweet_hashtags=hashtags,
                 media=media_urls,
-                user_id=user_results.get("rest_id"),
-                user_display_name=display_name or None,
-                user_verified=user_legacy.get("verified"),
+                user_id=user_results.get("rest_id") or "",
+                user_display_name=display_name or screen_name,
+                user_verified=user_legacy.get("verified", False),
                 tweet_id=tweet_id,
                 is_reply=is_reply,
                 is_quote=is_quote,
-                conversation_id=legacy.get("conversation_id_str"),
+                conversation_id=legacy.get("conversation_id_str") or "",
                 in_reply_to_user_id=legacy.get("in_reply_to_user_id_str"),
-                language=legacy.get("lang"),
+                language=legacy.get("lang") or "und",
                 in_reply_to_username=legacy.get(
                     "in_reply_to_screen_name"
                 ),
                 quoted_tweet_id=quoted_tweet_id,
-                like_count=legacy.get("favorite_count"),
-                retweet_count=legacy.get("retweet_count"),
-                reply_count=legacy.get("reply_count"),
-                quote_count=legacy.get("quote_count"),
-                view_count=view_count,
-                bookmark_count=legacy.get("bookmark_count"),
-                user_blue_verified=user_results.get("is_blue_verified"),
+                like_count=legacy.get("favorite_count", 0) or 0,
+                retweet_count=legacy.get("retweet_count", 0) or 0,
+                reply_count=legacy.get("reply_count", 0) or 0,
+                quote_count=legacy.get("quote_count", 0) or 0,
+                view_count=view_count or 0,
+                bookmark_count=legacy.get("bookmark_count", 0) or 0,
+                user_blue_verified=user_results.get(
+                    "is_blue_verified", False
+                ) or False,
                 user_description=user_legacy.get("description") or None,
                 user_location=user_legacy.get("location") or None,
                 profile_image_url=profile_image,
                 cover_picture_url=user_legacy.get("profile_banner_url")
                 or None,
-                user_followers_count=user_legacy.get("followers_count"),
-                user_following_count=user_legacy.get("friends_count"),
+                user_followers_count=user_legacy.get(
+                    "followers_count", 0
+                ) or 0,
+                user_following_count=user_legacy.get(
+                    "friends_count", 0
+                ) or 0,
                 scraped_at=dt.datetime.now(dt.timezone.utc),
             )
         except Exception:
