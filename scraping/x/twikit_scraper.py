@@ -1,6 +1,7 @@
 """
-Custom X/Twitter scraper using curl_cffi for Cloudflare bypass.
-Calls Twitter's GraphQL API directly with browser-like TLS fingerprint.
+Custom X/Twitter scraper using Playwright headless browser.
+Navigates to x.com search/tweet pages and intercepts GraphQL API responses.
+Bypasses Cloudflare because it runs a real Chromium browser.
 Requires browser cookies in twikit_cookies.json (auth_token, ct0, etc).
 """
 
@@ -14,7 +15,6 @@ import datetime as dt
 import bittensor as bt
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlencode, quote
 
 from common.data import DataEntity, DataLabel, DataSource
 from common.protocol import KeywordMode
@@ -25,103 +25,112 @@ from scraping.x import utils
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 COOKIES_FILE = os.path.join(PROJECT_ROOT, "twikit_cookies.json")
-HOMEPAGE_CACHE_FILE = os.path.join(PROJECT_ROOT, "twikit_homepage.html")
-
-BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-
-# Current GraphQL query IDs - update these when Twitter rotates them
-SEARCH_TIMELINE_ID = "GcXk9vN_d1jUfHNqLacXQA"
-TWEET_DETAIL_ID = "CysGzLIZa76UzZ3WTe-Bhg"
-
-GRAPHQL_FEATURES = {
-    "rweb_video_screen_enabled": False,
-    "profile_label_improvements_pcf_label_in_post_enabled": True,
-    "responsive_web_profile_redirect_enabled": False,
-    "rweb_tipjar_consumption_enabled": False,
-    "verified_phone_label_enabled": True,
-    "creator_subscriptions_tweet_preview_api_enabled": True,
-    "responsive_web_graphql_timeline_navigation_enabled": True,
-    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "premium_content_api_read_enabled": False,
-    "communities_web_enable_tweet_community_results_fetch": True,
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
-    "responsive_web_grok_analyze_post_followups_enabled": True,
-    "responsive_web_jetfuel_frame": True,
-    "responsive_web_grok_share_attachment_enabled": True,
-    "responsive_web_grok_annotations_enabled": True,
-    "articles_preview_enabled": True,
-    "responsive_web_edit_tweet_api_enabled": True,
-    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-    "view_counts_everywhere_api_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
-    "responsive_web_twitter_article_tweet_consumption_enabled": True,
-    "content_disclosure_indicator_enabled": True,
-    "content_disclosure_ai_generated_indicator_enabled": True,
-    "responsive_web_grok_show_grok_translated_post": False,
-    "responsive_web_grok_analysis_button_from_backend": True,
-    "post_ctas_fetch_enabled": True,
-    "freedom_of_speech_not_reach_fetch_enabled": True,
-    "standardized_nudges_misinfo": True,
-    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
-    "longform_notetweets_rich_text_read_enabled": True,
-    "longform_notetweets_inline_media_enabled": False,
-    "responsive_web_grok_image_annotation_enabled": True,
-    "responsive_web_grok_imagine_annotation_enabled": True,
-    "responsive_web_grok_community_note_auto_translation_is_enabled": False,
-    "responsive_web_enhance_cards_enabled": False,
-}
-
-FIELD_TOGGLES = {
-    "withArticleRichContentState": True,
-    "withArticlePlainText": False,
-    "withArticleSummaryText": True,
-    "withArticleVoiceOver": True,
-    "withGrokAnalyze": False,
-    "withDisallowedReplyControls": False,
-}
 
 
 class TwikitTwitterScraper(Scraper):
     """
-    Scrapes tweets using Twitter's GraphQL API directly via curl_cffi.
-    Bypasses Cloudflare by impersonating browser TLS fingerprint.
+    Scrapes tweets using Playwright headless Chromium.
+    Navigates to x.com pages and intercepts the GraphQL API responses
+    that the browser makes naturally, bypassing all anti-bot measures.
     """
 
     SCRAPE_TIMEOUT_SECS = 120
     concurrent_validates_semaphore = threading.BoundedSemaphore(5)
 
-    # Shared state across all instances
-    _cookies = None
+    # Shared browser state across all instances
+    _browser = None
+    _context = None
+    _browser_lock = None
     _rate_lock = None
-    _transaction = None
-    _transaction_lock = None
     _last_request_time = 0
-    MIN_REQUEST_INTERVAL = 3.0
+    MIN_REQUEST_INTERVAL = 4.0
     MAX_RETRIES = 3
 
     def __init__(self):
+        if TwikitTwitterScraper._browser_lock is None:
+            TwikitTwitterScraper._browser_lock = asyncio.Lock()
         if TwikitTwitterScraper._rate_lock is None:
             TwikitTwitterScraper._rate_lock = asyncio.Lock()
-        if TwikitTwitterScraper._transaction_lock is None:
-            TwikitTwitterScraper._transaction_lock = asyncio.Lock()
 
-    def _load_cookies(self):
-        """Load cookies from file (cached across instances)."""
-        if TwikitTwitterScraper._cookies is not None:
-            return TwikitTwitterScraper._cookies
-
+    @staticmethod
+    def _load_cookies_raw() -> dict:
+        """Load raw cookie dict from file."""
         if not os.path.exists(COOKIES_FILE):
             raise FileNotFoundError(
                 f"Cookie file not found: {COOKIES_FILE}. "
                 "Export cookies from your browser."
             )
-
         with open(COOKIES_FILE, "r") as f:
-            TwikitTwitterScraper._cookies = json.load(f)
+            return json.load(f)
 
-        bt.logging.success("Loaded X cookies from file")
-        return TwikitTwitterScraper._cookies
+    @staticmethod
+    def _cookies_for_playwright(raw_cookies: dict) -> list:
+        """Convert raw cookie dict to Playwright cookie format."""
+        pw_cookies = []
+        for name, value in raw_cookies.items():
+            pw_cookies.append({
+                "name": name,
+                "value": str(value),
+                "domain": ".x.com",
+                "path": "/",
+                "httpOnly": name in ("auth_token",),
+                "secure": True,
+                "sameSite": "None",
+            })
+        return pw_cookies
+
+    async def _ensure_browser(self):
+        """Ensure browser and context are initialized (singleton)."""
+        if TwikitTwitterScraper._context is not None:
+            return TwikitTwitterScraper._context
+
+        async with TwikitTwitterScraper._browser_lock:
+            if TwikitTwitterScraper._context is not None:
+                return TwikitTwitterScraper._context
+
+            from playwright.async_api import async_playwright
+
+            bt.logging.info("Launching Playwright browser for X scraping...")
+
+            raw_cookies = self._load_cookies_raw()
+            pw_cookies = self._cookies_for_playwright(raw_cookies)
+
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/145.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+
+            await context.add_cookies(pw_cookies)
+
+            # Remove webdriver flag
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+
+            TwikitTwitterScraper._browser = browser
+            TwikitTwitterScraper._context = context
+            TwikitTwitterScraper._playwright = p
+
+            bt.logging.success("Playwright browser launched and cookies loaded")
+            return context
 
     async def _rate_limit(self):
         """Simple rate limiter."""
@@ -132,197 +141,89 @@ class TwikitTwitterScraper(Scraper):
                 await asyncio.sleep(self.MIN_REQUEST_INTERVAL - elapsed)
             TwikitTwitterScraper._last_request_time = time.time()
 
-    async def _get_transaction(self):
-        """Get or initialize the ClientTransaction for generating IDs."""
-        if TwikitTwitterScraper._transaction is not None:
-            return TwikitTwitterScraper._transaction
+    async def _intercept_api_response(
+        self, url: str, api_pattern: str, timeout_ms: int = 30000
+    ) -> Optional[dict]:
+        """
+        Navigate to a URL and intercept the matching API response.
+        Returns the parsed JSON from the intercepted response.
+        """
+        context = await self._ensure_browser()
+        page = await context.new_page()
 
-        async with TwikitTwitterScraper._transaction_lock:
-            if TwikitTwitterScraper._transaction is not None:
-                return TwikitTwitterScraper._transaction
+        captured_response = None
+        capture_event = asyncio.Event()
 
-            if not os.path.exists(HOMEPAGE_CACHE_FILE):
-                bt.logging.warning("No homepage cache - transaction IDs unavailable")
-                return None
+        async def handle_response(response):
+            nonlocal captured_response
+            if api_pattern in response.url and captured_response is None:
+                try:
+                    if response.status == 200:
+                        body = await response.json()
+                        captured_response = body
+                        capture_event.set()
+                    else:
+                        bt.logging.warning(
+                            f"API response {response.status} for {api_pattern}"
+                        )
+                except Exception:
+                    pass
 
+        page.on("response", handle_response)
+
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+            # Wait for the API response to be captured
             try:
-                import bs4
-                from twikit.x_client_transaction import ClientTransaction
-                from curl_cffi.requests import AsyncSession
-
-                with open(HOMEPAGE_CACHE_FILE, "r", encoding="utf-8") as f:
-                    html = f.read()
-
-                home_page = bs4.BeautifulSoup(html, "lxml")
-                ct = ClientTransaction()
-                ct.home_page_response = home_page
-
-                # Fetch ondemand.s.js for key byte indices using curl_cffi
-                headers = {
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Cache-Control": "no-cache",
-                    "Referer": "https://x.com",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-                }
-
-                import re
-                from twikit.x_client_transaction.transaction import (
-                    ON_DEMAND_FILE_REGEX, ON_DEMAND_HASH_PATTERN, INDICES_REGEX
-                )
-
-                response_text = str(home_page)
-                on_demand_file = ON_DEMAND_FILE_REGEX.search(response_text)
-                if not on_demand_file:
-                    bt.logging.warning("Could not find ondemand.s chunk in homepage")
-                    return None
-
-                chunk_index = on_demand_file.group(1)
-                hash_pattern = re.compile(ON_DEMAND_HASH_PATTERN.format(chunk_index))
-                hash_match = hash_pattern.search(response_text)
-                if not hash_match:
-                    bt.logging.warning("Could not find hash for ondemand.s chunk")
-                    return None
-
-                file_hash = hash_match.group(1)
-                js_url = f"https://abs.twimg.com/responsive-web/client-web/ondemand.s.{file_hash}a.js"
-
-                async with AsyncSession(impersonate="chrome") as session:
-                    js_resp = await session.get(js_url, headers=headers, timeout=15)
-                    js_text = js_resp.text
-
-                key_byte_indices = []
-                for item in INDICES_REGEX.finditer(js_text):
-                    key_byte_indices.append(int(item.group(1)))
-
-                if not key_byte_indices:
-                    bt.logging.warning("Could not extract key byte indices")
-                    return None
-
-                ct.DEFAULT_ROW_INDEX = key_byte_indices[0]
-                ct.DEFAULT_KEY_BYTES_INDICES = key_byte_indices[1:]
-                ct.key = ct.get_key(response=home_page)
-                ct.key_bytes = ct.get_key_bytes(key=ct.key)
-                ct.animation_key = ct.get_animation_key(
-                    key_bytes=ct.key_bytes, response=home_page
-                )
-
-                TwikitTwitterScraper._transaction = ct
-                bt.logging.success("ClientTransaction initialized from cache")
-                return ct
-
-            except Exception:
+                await asyncio.wait_for(capture_event.wait(), timeout=timeout_ms / 1000)
+            except asyncio.TimeoutError:
                 bt.logging.warning(
-                    f"Failed to init ClientTransaction: {traceback.format_exc()}"
+                    f"Timeout waiting for API response matching '{api_pattern}'"
                 )
-                return None
 
-    def _build_headers(self, cookies: dict, method: str = "GET",
-                       path: str = "") -> dict:
-        """Build request headers matching browser format."""
-        headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {BEARER_TOKEN}",
-            "content-type": "application/json",
-            "x-csrf-token": cookies.get("ct0", ""),
-            "x-twitter-active-user": "yes",
-            "x-twitter-auth-type": "OAuth2Session",
-            "x-twitter-client-language": "en",
-        }
+            return captured_response
 
-        # Add transaction ID if available
-        ct = TwikitTwitterScraper._transaction
-        if ct is not None:
-            try:
-                tid = ct.generate_transaction_id(method=method, path=path)
-                headers["x-client-transaction-id"] = tid
-            except Exception:
-                pass
-
-        return headers
-
-    async def _graphql_request(self, query_id: str, operation: str,
-                                variables: dict, extra_params: dict = None) -> dict:
-        """Make a GraphQL request to Twitter API using curl_cffi."""
-        from curl_cffi.requests import AsyncSession
-
-        # Ensure transaction is initialized
-        await self._get_transaction()
-
-        cookies = self._load_cookies()
-        api_path = f"/i/api/graphql/{query_id}/{operation}"
-        headers = self._build_headers(cookies, method="GET", path=api_path)
-
-        params = {
-            "variables": json.dumps(variables, separators=(",", ":")),
-            "features": json.dumps(GRAPHQL_FEATURES, separators=(",", ":")),
-        }
-        if extra_params:
-            for k, v in extra_params.items():
-                params[k] = json.dumps(v, separators=(",", ":")) if isinstance(v, dict) else v
-
-        base_url = f"https://x.com{api_path}"
-
-        async with AsyncSession(impersonate="chrome") as session:
-            response = await session.get(
-                base_url,
-                params=params,
-                headers=headers,
-                cookies=cookies,
-                timeout=30,
-            )
-
-            bt.logging.debug(
-                f"GraphQL {operation}: status={response.status_code}, "
-                f"tid={'yes' if 'x-client-transaction-id' in headers else 'NO'}, "
-                f"body_len={len(response.text)}, "
-                f"body_preview={response.text[:200]}"
-            )
-
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
-                raise RateLimitError(f"Rate limited (429)")
-            else:
-                raise APIError(
-                    f"Twitter API returned {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
+        except Exception as e:
+            bt.logging.error(f"Page navigation failed: {e}")
+            return None
+        finally:
+            await page.close()
 
     async def _search_tweets(self, query: str, count: int = 20) -> list:
-        """Search tweets and return raw tweet data list."""
-        variables = {
-            "rawQuery": query,
-            "count": count,
-            "querySource": "typed_query",
-            "product": "Latest",
-        }
+        """Search tweets by navigating to the search page."""
+        from urllib.parse import quote
+
+        search_url = f"https://x.com/search?q={quote(query)}&src=typed_query&f=live"
 
         await self._rate_limit()
-        data = await self._graphql_request(
-            SEARCH_TIMELINE_ID, "SearchTimeline", variables
+
+        bt.logging.debug(f"Playwright search: {query}")
+        data = await self._intercept_api_response(
+            search_url, "SearchTimeline", timeout_ms=45000
         )
+
+        if not data:
+            bt.logging.warning("No SearchTimeline response captured")
+            return []
 
         return self._extract_tweets_from_timeline(data)
 
-    async def _get_tweet_detail(self, tweet_id: str) -> Optional[dict]:
-        """Get a single tweet by ID."""
-        variables = {
-            "focalTweetId": tweet_id,
-            "with_rux_injections": False,
-            "rankingMode": "Relevance",
-            "includePromotedContent": True,
-            "withCommunity": True,
-            "withQuickPromoteEligibilityTweetFields": True,
-            "withBirdwatchNotes": True,
-            "withVoice": True,
-        }
+    async def _get_tweet_detail(self, tweet_id: str, tweet_url: str = None) -> Optional[dict]:
+        """Get a single tweet by navigating to its page."""
+        if not tweet_url:
+            tweet_url = f"https://x.com/i/status/{tweet_id}"
 
         await self._rate_limit()
-        data = await self._graphql_request(
-            TWEET_DETAIL_ID, "TweetDetail", variables,
-            extra_params={"fieldToggles": FIELD_TOGGLES}
+
+        bt.logging.debug(f"Playwright tweet detail: {tweet_id}")
+        data = await self._intercept_api_response(
+            tweet_url, "TweetDetail", timeout_ms=30000
         )
+
+        if not data:
+            bt.logging.warning(f"No TweetDetail response captured for {tweet_id}")
+            return None
 
         tweets = self._extract_tweets_from_detail(data)
         # Find the focal tweet
@@ -335,14 +236,19 @@ class TwikitTwitterScraper(Scraper):
         """Extract tweet data from SearchTimeline response."""
         tweets = []
         try:
-            instructions = data.get("data", {}).get("search_by_raw_query", {}).get("search_timeline", {}).get("timeline", {}).get("instructions", [])
+            instructions = (
+                data.get("data", {})
+                .get("search_by_raw_query", {})
+                .get("search_timeline", {})
+                .get("timeline", {})
+                .get("instructions", [])
+            )
             for instruction in instructions:
                 entries = instruction.get("entries", [])
                 for entry in entries:
                     content = entry.get("content", {})
                     item_content = content.get("itemContent", {})
                     if not item_content:
-                        # Check for items in moduleItems
                         items = content.get("items", [])
                         for item in items:
                             ic = item.get("item", {}).get("itemContent", {})
@@ -364,7 +270,11 @@ class TwikitTwitterScraper(Scraper):
         """Extract tweet data from TweetDetail response."""
         tweets = []
         try:
-            instructions = data.get("data", {}).get("threaded_conversation_with_injections_v2", {}).get("instructions", [])
+            instructions = (
+                data.get("data", {})
+                .get("threaded_conversation_with_injections_v2", {})
+                .get("instructions", [])
+            )
             for instruction in instructions:
                 entries = instruction.get("entries", [])
                 for entry in entries:
@@ -375,7 +285,6 @@ class TwikitTwitterScraper(Scraper):
                         result = tweet_results.get("result", {})
                         if result:
                             tweets.append(self._normalize_tweet_result(result))
-                    # Also check items for threaded replies
                     items = content.get("items", [])
                     for item in items:
                         ic = item.get("item", {}).get("itemContent", {})
@@ -384,12 +293,13 @@ class TwikitTwitterScraper(Scraper):
                         if result:
                             tweets.append(self._normalize_tweet_result(result))
         except Exception:
-            bt.logging.warning(f"Failed to extract tweet detail: {traceback.format_exc()}")
+            bt.logging.warning(
+                f"Failed to extract tweet detail: {traceback.format_exc()}"
+            )
         return [t for t in tweets if t is not None]
 
     def _normalize_tweet_result(self, result: dict) -> Optional[dict]:
-        """Normalize a tweet result object, handling various wrapper types."""
-        # Handle TweetWithVisibilityResults wrapper
+        """Normalize a tweet result object."""
         if result.get("__typename") == "TweetWithVisibilityResults":
             result = result.get("tweet", {})
         if result.get("__typename") == "TweetTombstone":
@@ -423,40 +333,37 @@ class TwikitTwitterScraper(Scraper):
 
             url = f"https://x.com/{screen_name}/status/{tweet_id}"
 
-            # Text
             text = legacy.get("full_text", "")
 
-            # Hashtags
             hashtags = []
             entities = legacy.get("entities", {})
             for ht in entities.get("hashtags", []):
                 hashtags.append(f"#{ht.get('text', '')}")
 
-            # Media
             media_urls = None
             extended = legacy.get("extended_entities", {})
             media_list = extended.get("media", entities.get("media", []))
             if media_list:
-                media_urls = [m.get("media_url_https") or m.get("media_url") for m in media_list if m.get("media_url_https") or m.get("media_url")]
+                media_urls = [
+                    m.get("media_url_https") or m.get("media_url")
+                    for m in media_list
+                    if m.get("media_url_https") or m.get("media_url")
+                ]
                 if not media_urls:
                     media_urls = None
 
-            # Timestamp
             created_at = legacy.get("created_at", "")
             timestamp = dt.datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
 
-            # Reply/quote info
             in_reply_to_status = legacy.get("in_reply_to_status_id_str")
             is_reply = in_reply_to_status is not None
             is_quote = legacy.get("is_quote_status", False)
 
-            # Quoted tweet
             quoted_tweet_id = None
             quoted = tweet_data.get("quoted_status_result", {}).get("result", {})
             if quoted:
                 quoted_tweet_id = quoted.get("rest_id")
 
-            # View count
             views = tweet_data.get("views", {})
             view_count = self._safe_int(views.get("count"))
 
@@ -467,11 +374,9 @@ class TwikitTwitterScraper(Scraper):
                 timestamp=timestamp,
                 tweet_hashtags=hashtags,
                 media=media_urls,
-                # User fields
                 user_id=user_results.get("rest_id"),
                 user_display_name=user_legacy.get("name"),
                 user_verified=user_legacy.get("verified"),
-                # Tweet metadata
                 tweet_id=tweet_id,
                 is_reply=is_reply,
                 is_quote=is_quote,
@@ -480,18 +385,18 @@ class TwikitTwitterScraper(Scraper):
                 language=legacy.get("lang"),
                 in_reply_to_username=legacy.get("in_reply_to_screen_name"),
                 quoted_tweet_id=quoted_tweet_id,
-                # Engagement
                 like_count=legacy.get("favorite_count"),
                 retweet_count=legacy.get("retweet_count"),
                 reply_count=legacy.get("reply_count"),
                 quote_count=legacy.get("quote_count"),
                 view_count=view_count,
                 bookmark_count=legacy.get("bookmark_count"),
-                # User profile
                 user_blue_verified=user_results.get("is_blue_verified"),
                 user_description=user_legacy.get("description") or None,
                 user_location=user_legacy.get("location") or None,
-                profile_image_url=user_legacy.get("profile_image_url_https") or None,
+                profile_image_url=user_legacy.get(
+                    "profile_image_url_https"
+                ) or None,
                 cover_picture_url=user_legacy.get("profile_banner_url") or None,
                 user_followers_count=user_legacy.get("followers_count"),
                 user_following_count=user_legacy.get("friends_count"),
@@ -502,39 +407,38 @@ class TwikitTwitterScraper(Scraper):
             return None
 
     async def _search_with_retry(self, query: str, count: int = 20) -> list:
-        """Search with retry on rate limit."""
+        """Search with retry on failure."""
         for attempt in range(self.MAX_RETRIES):
             try:
-                return await self._search_tweets(query, count)
-            except RateLimitError:
-                wait = 15 * (attempt + 1)
-                bt.logging.warning(
-                    f"Rate limited on attempt {attempt + 1}, waiting {wait}s"
-                )
-                await asyncio.sleep(wait)
+                results = await self._search_tweets(query, count)
+                if results:
+                    return results
+                if attempt < self.MAX_RETRIES - 1:
+                    wait = 10 * (attempt + 1)
+                    bt.logging.warning(
+                        f"Search returned 0 results on attempt {attempt + 1}, "
+                        f"retrying in {wait}s"
+                    )
+                    await asyncio.sleep(wait)
             except Exception:
-                bt.logging.error(
-                    f"Search failed: {traceback.format_exc()}"
-                )
-                return []
+                bt.logging.error(f"Search failed: {traceback.format_exc()}")
+                if attempt < self.MAX_RETRIES - 1:
+                    await asyncio.sleep(10 * (attempt + 1))
         return []
 
     async def _get_tweet_with_retry(self, tweet_id: str) -> Optional[dict]:
         """Get tweet by ID with retry."""
         for attempt in range(self.MAX_RETRIES):
             try:
-                return await self._get_tweet_detail(tweet_id)
-            except RateLimitError:
-                wait = 15 * (attempt + 1)
-                bt.logging.warning(
-                    f"Rate limited fetching tweet {tweet_id}, waiting {wait}s"
-                )
-                await asyncio.sleep(wait)
+                result = await self._get_tweet_detail(tweet_id)
+                if result:
+                    return result
+                if attempt < self.MAX_RETRIES - 1:
+                    await asyncio.sleep(10 * (attempt + 1))
             except Exception:
-                bt.logging.error(
-                    f"Get tweet failed: {traceback.format_exc()}"
-                )
-                return None
+                bt.logging.error(f"Get tweet failed: {traceback.format_exc()}")
+                if attempt < self.MAX_RETRIES - 1:
+                    await asyncio.sleep(10 * (attempt + 1))
         return None
 
     async def validate(
@@ -570,7 +474,12 @@ class TwikitTwitterScraper(Scraper):
                     )
 
                 legacy = tweet_data.get("legacy", {})
-                user_legacy = tweet_data.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
+                user_legacy = (
+                    tweet_data.get("core", {})
+                    .get("user_results", {})
+                    .get("result", {})
+                    .get("legacy", {})
+                )
 
                 author_data = {
                     "followers": user_legacy.get("followers_count", 0),
@@ -626,7 +535,6 @@ class TwikitTwitterScraper(Scraper):
         self, scrape_config: ScrapeConfig, allow_low_engagement: bool = False
     ) -> List[DataEntity]:
         """Scrape tweets based on config."""
-        # Build search query
         query_parts = []
 
         if scrape_config.labels:
@@ -668,8 +576,15 @@ class TwikitTwitterScraper(Scraper):
                 continue
 
             if not allow_low_engagement:
-                user_legacy = tweet_data.get("core", {}).get("user_results", {}).get("result", {}).get("legacy", {})
-                author_data = {"followers": user_legacy.get("followers_count", 0)}
+                user_legacy = (
+                    tweet_data.get("core", {})
+                    .get("user_results", {})
+                    .get("result", {})
+                    .get("legacy", {})
+                )
+                author_data = {
+                    "followers": user_legacy.get("followers_count", 0)
+                }
                 if utils.is_spam_account(author_data):
                     continue
                 views = tweet_data.get("views", {})
@@ -721,7 +636,6 @@ class TwikitTwitterScraper(Scraper):
                 )
                 return []
 
-        # Return empty if no params
         if all(
             param is None
             for param in [usernames, keywords, start_datetime, end_datetime]
@@ -733,7 +647,6 @@ class TwikitTwitterScraper(Scraper):
             f"keywords={keywords}, mode={keyword_mode}"
         )
 
-        # Build search query
         query_parts = []
 
         if start_datetime:
@@ -774,11 +687,3 @@ class TwikitTwitterScraper(Scraper):
             f"On-demand X scrape completed. Found {len(data_entities)} items."
         )
         return data_entities
-
-
-class RateLimitError(Exception):
-    pass
-
-
-class APIError(Exception):
-    pass
