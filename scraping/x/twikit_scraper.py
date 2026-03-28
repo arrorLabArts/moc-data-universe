@@ -162,30 +162,59 @@ class TwikitTwitterScraper(Scraper):
                         body = await response.json()
                         captured_response = body
                         capture_event.set()
+                        bt.logging.debug(
+                            f"Captured {api_pattern} response (200)"
+                        )
                     else:
                         bt.logging.warning(
                             f"API response {response.status} for {api_pattern}"
                         )
-                except Exception:
-                    pass
+                        # On non-200, also set event so we don't wait forever
+                        capture_event.set()
+                except Exception as e:
+                    bt.logging.warning(f"Error reading API response: {e}")
 
         page.on("response", handle_response)
 
         try:
+            # Start navigation (don't wait for networkidle - Twitter never idles)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
-            # Wait for the API response to be captured
+            # Wait for the API response to be intercepted
+            bt.logging.debug(
+                f"Page DOM loaded, waiting up to 20s for {api_pattern}..."
+            )
             try:
-                await asyncio.wait_for(capture_event.wait(), timeout=timeout_ms / 1000)
+                await asyncio.wait_for(capture_event.wait(), timeout=20)
             except asyncio.TimeoutError:
+                page_title = await page.title()
+                page_url = page.url
                 bt.logging.warning(
-                    f"Timeout waiting for API response matching '{api_pattern}'"
+                    f"Timeout waiting for {api_pattern}. "
+                    f"title='{page_title}', url='{page_url}'"
                 )
+                try:
+                    await page.screenshot(
+                        path="/tmp/pw_debug.png", full_page=False
+                    )
+                    bt.logging.info(
+                        "Debug screenshot saved to /tmp/pw_debug.png"
+                    )
+                except Exception:
+                    pass
 
             return captured_response
 
         except Exception as e:
             bt.logging.error(f"Page navigation failed: {e}")
+            try:
+                page_title = await page.title()
+                bt.logging.error(f"Page title on error: '{page_title}'")
+                await page.screenshot(
+                    path="/tmp/pw_debug.png", full_page=False
+                )
+            except Exception:
+                pass
             return None
         finally:
             await page.close()

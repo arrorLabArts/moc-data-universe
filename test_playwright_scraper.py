@@ -1,6 +1,7 @@
-"""Quick test: can Playwright actually fetch tweets from Twitter?"""
+"""Quick test: Playwright with domcontentloaded + event wait"""
 import asyncio
 import json
+import time
 from playwright.async_api import async_playwright
 
 COOKIES_FILE = "twikit_cookies.json"
@@ -49,8 +50,8 @@ async def test_search():
 
     page = await context.new_page()
 
-    # Capture API responses
     captured = {}
+    capture_event = asyncio.Event()
 
     async def on_response(response):
         url = response.url
@@ -58,96 +59,66 @@ async def test_search():
             try:
                 body = await response.json()
                 captured["search"] = body
-                print(f"  [CAPTURED] SearchTimeline: status={response.status}, keys={list(body.keys()) if body else 'none'}")
+                capture_event.set()
+                print(f"  [CAPTURED] SearchTimeline: status={response.status}")
             except Exception as e:
-                captured["search_error"] = str(e)
-                print(f"  [ERROR] SearchTimeline: {e}")
-        elif "TweetDetail" in url:
-            try:
-                body = await response.json()
-                captured["detail"] = body
-                print(f"  [CAPTURED] TweetDetail: status={response.status}")
-            except Exception as e:
-                print(f"  [ERROR] TweetDetail: {e}")
+                print(f"  [ERROR] SearchTimeline response: {e}")
+                capture_event.set()
+        if "/i/api/" in url and response.status != 200:
+            print(f"  [API] {response.status} {url[:120]}")
 
     page.on("response", on_response)
 
-    # Test 1: Search
-    print("=== Test 1: Search for 'bitcoin' ===")
+    print("=== Search for 'bitcoin' ===")
+    t0 = time.time()
+
     await page.goto(
         "https://x.com/search?q=bitcoin&src=typed_query&f=live",
         wait_until="domcontentloaded",
         timeout=45000,
     )
+    print(f"  DOM loaded in {time.time()-t0:.1f}s")
 
-    # Give time for API calls
-    await asyncio.sleep(8)
+    # Wait for API response
+    try:
+        await asyncio.wait_for(capture_event.wait(), timeout=20)
+        print(f"  API captured in {time.time()-t0:.1f}s")
+    except asyncio.TimeoutError:
+        print(f"  TIMEOUT after {time.time()-t0:.1f}s")
+        title = await page.title()
+        print(f"  Page title: {title}")
+        print(f"  Page URL: {page.url}")
 
-    # Check page title and content
-    title = await page.title()
-    print(f"  Page title: {title}")
-
-    # Check if we got tweets in the DOM
     tweet_count = await page.locator('[data-testid="tweet"]').count()
-    print(f"  Tweets visible in DOM: {tweet_count}")
+    print(f"  Tweets in DOM: {tweet_count}")
 
     if "search" in captured:
         data = captured["search"]
-        try:
-            instructions = (
-                data.get("data", {})
-                .get("search_by_raw_query", {})
-                .get("search_timeline", {})
-                .get("timeline", {})
-                .get("instructions", [])
-            )
-            tweet_entries = 0
-            for inst in instructions:
-                for entry in inst.get("entries", []):
-                    if "tweet-" in entry.get("entryId", ""):
-                        tweet_entries += 1
-            print(f"  Tweets in API response: {tweet_entries}")
-            if tweet_entries > 0:
-                # Print first tweet
-                for inst in instructions:
-                    for entry in inst.get("entries", []):
-                        if "tweet-" in entry.get("entryId", ""):
-                            result = (
-                                entry.get("content", {})
-                                .get("itemContent", {})
-                                .get("tweet_results", {})
-                                .get("result", {})
-                            )
-                            legacy = result.get("legacy", {})
-                            user = (
-                                result.get("core", {})
-                                .get("user_results", {})
-                                .get("result", {})
-                                .get("legacy", {})
-                            )
-                            print(f"  First tweet: @{user.get('screen_name')}: {legacy.get('full_text', '')[:100]}")
-                            break
-                    break
-        except Exception as e:
-            print(f"  Parse error: {e}")
-            print(f"  Raw keys: {json.dumps(list(data.keys()))}")
+        instructions = (
+            data.get("data", {})
+            .get("search_by_raw_query", {})
+            .get("search_timeline", {})
+            .get("timeline", {})
+            .get("instructions", [])
+        )
+        tweet_entries = sum(
+            1 for inst in instructions
+            for entry in inst.get("entries", [])
+            if "tweet-" in entry.get("entryId", "")
+        )
+        print(f"  Tweets in API: {tweet_entries}")
     else:
-        print("  No SearchTimeline response captured!")
-        # Check what URL the page ended up on
-        print(f"  Current URL: {page.url}")
+        print("  No SearchTimeline captured!")
 
-    # Take screenshot for debugging
-    await page.screenshot(path="/tmp/pw_test.png")
-    print("  Screenshot saved to /tmp/pw_test.png")
+    await page.screenshot(path="/tmp/pw_test2.png")
+    print("  Screenshot: /tmp/pw_test2.png")
 
     await page.close()
     await browser.close()
     await p.stop()
-
-    print("\n=== Done ===")
     return bool(captured.get("search"))
 
 
 if __name__ == "__main__":
-    success = asyncio.run(test_search())
-    print(f"\nResult: {'SUCCESS' if success else 'FAILED'}")
+    ok = asyncio.run(test_search())
+    print(f"\nResult: {'SUCCESS' if ok else 'FAILED'}")
